@@ -1,6 +1,6 @@
 {
   "name": "lan-video-streamer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "LAN video streamer with mobile-friendly web UI",
   "main": "server.js",
   "scripts": {
