@@ -1,0 +1,140 @@
+﻿<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN Media Streamer - Desktop</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="desktop viewer-page" data-view-mode="list" data-grid-size="m">
+    <main class="viewer-shell">
+      <section class="topbar panel">
+        <div class="title-row">
+          <h1>LAN Media Streamer</h1>
+          <div class="actions">
+            <button id="theme-toggle" type="button" class="btn-secondary">切換：深色主題</button>
+            <button id="favorites-toggle" type="button" class="btn-secondary">收藏夾</button>
+            <button id="view-toggle" type="button" class="btn-secondary">網格檢視</button>
+            <button id="folder-thumb-toggle" type="button" class="btn-secondary">資料夾縮圖: 開</button>
+            <button id="path-toggle" type="button" class="btn-secondary">路徑: 開</button>
+            <button id="detail-toggle" type="button" class="btn-secondary">詳細: 開</button>
+            <button id="refresh" type="button">刷新</button>
+            <a class="btn-secondary" href="/admin.html">管理端</a>
+          </div>
+        </div>
+        <p id="status-text" class="muted">載入中...</p>
+      </section>
+
+      <section id="browse-panel" class="panel">
+        <div class="filter-row advanced">
+          <input id="search-input" type="text" placeholder="搜尋資料夾 / 檔名 / 路徑" />
+          <select id="sort-select">
+            <option value="time_desc">時間：新到舊</option>
+            <option value="time_asc">時間：舊到新</option>
+            <option value="name_asc">檔名：A-Z</option>
+            <option value="name_desc">檔名：Z-A</option>
+            <option value="size_desc">大小：大到小</option>
+            <option value="size_asc">大小：小到大</option>
+            <option value="type_asc">類型分組</option>
+          </select>
+          <select id="grid-size-select">
+            <option value="s">小格</option>
+            <option value="m" selected>中格</option>
+            <option value="l">大格</option>
+          </select>
+        </div>
+
+        <div class="type-row">
+          <div id="type-checks" class="type-checks">
+            <label><input type="checkbox" value="video" checked />影片</label>
+            <label><input type="checkbox" value="image" checked />圖片</label>
+            <label><input type="checkbox" value="audio" checked />音訊</label>
+            <label><input type="checkbox" value="document" checked />文件</label>
+            <label><input type="checkbox" value="archive" checked />壓縮檔</label>
+            <label><input type="checkbox" value="code" checked />程式碼</label>
+            <label><input type="checkbox" value="other" checked />其他</label>
+          </div>
+          <div class="type-actions">
+            <button id="types-all" type="button" class="btn-secondary">全選</button>
+            <button id="types-none" type="button" class="btn-secondary">全不選</button>
+          </div>
+        </div>
+
+        <div id="tree-container" class="tree-container"></div>
+        <div id="folder-grid-container" class="folder-grid-container hidden"></div>
+        <p id="empty-state" class="muted hidden">沒有符合條件的檔案。</p>
+      </section>
+
+      <section id="favorites-panel" class="panel hidden favorites-panel">
+        <div class="title-row">
+          <h2>收藏夾</h2>
+          <div class="actions">
+            <button id="favorites-back" type="button" class="btn-secondary">返回瀏覽</button>
+            <button id="favorites-clear" type="button" class="btn-secondary">清空收藏</button>
+          </div>
+        </div>
+        <div class="favorites-columns">
+          <section>
+            <h3>收藏資料夾</h3>
+            <div id="favorite-folders" class="favorites-grid"></div>
+          </section>
+          <section>
+            <h3>收藏文件</h3>
+            <div id="favorite-items" class="favorites-grid"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="viewer-overlay" class="viewer-overlay hidden" aria-hidden="true">
+      <div class="overlay-backdrop" data-action="close-overlay"></div>
+      <section class="overlay-panel" role="dialog" aria-modal="true" aria-label="預覽播放器">
+        <div class="overlay-actions">
+          <button id="prev-item" type="button" class="btn-secondary">上一個</button>
+          <button id="next-item" type="button" class="btn-secondary">下一個</button>
+          <button id="favorite-current" type="button" class="btn-secondary">收藏本文件</button>
+          <button id="viewer-name-toggle" type="button" class="btn-secondary">檔名: 開</button>
+          <button id="toggle-strip" type="button" class="btn-secondary">顯示縮圖列</button>
+          <button id="close-overlay" type="button">返回</button>
+          <a id="download-link" class="btn-secondary" href="#" target="_blank" rel="noreferrer">下載</a>
+        </div>
+
+        <h2 id="viewer-title" class="overlay-title">請選擇檔案</h2>
+
+        <div class="overlay-media-wrap">
+          <video id="video-viewer" controls playsinline preload="metadata" class="hidden"></video>
+          <audio id="audio-viewer" controls class="hidden"></audio>
+          <img id="image-viewer" class="hidden image-viewer" alt="preview" />
+        </div>
+
+        <div id="video-scrub-wrap" class="video-scrub-wrap hidden">
+          <input id="video-scrub" type="range" min="0" max="0" step="0.1" value="0" />
+        </div>
+
+        <div id="folder-strip" class="folder-strip"></div>
+      </section>
+    </div>
+
+    <div class="floating-actions">
+      <button id="scroll-top" type="button" class="btn-secondary">回到頂部</button>
+      <button id="scroll-last" type="button" class="btn-secondary" disabled>回到剛看位置</button>
+    </div>
+
+    <div id="folder-menu" class="folder-menu hidden">
+      <button type="button" data-menu-action="expand-siblings">展開同級資料夾</button>
+      <button type="button" data-menu-action="collapse-siblings">收合同級資料夾</button>
+      <button type="button" data-menu-action="expand-children">展開此資料夾全部子層</button>
+      <button type="button" data-menu-action="collapse-children">收合此資料夾全部子層</button>
+      <button type="button" data-menu-action="expand-all">展開全部資料夾</button>
+      <button type="button" data-menu-action="collapse-all">收合全部資料夾</button>
+      <button type="button" data-menu-action="focus-tree">在樹狀中定位此資料夾</button>
+      <button type="button" data-menu-action="only-this-path">只保留此路徑展開</button>
+      <button type="button" data-menu-action="favorite-folder">收藏/取消收藏此資料夾</button>
+      <button type="button" data-menu-action="toggle-folder-thumbs">切換全部資料夾縮圖</button>
+      <button type="button" data-menu-action="copy-path">複製資料夾路徑</button>
+      <button type="button" data-menu-action="reset-view-state">重設檢視記憶</button>
+    </div>
+
+    <script src="/viewer.js"></script>
+  </body>
+</html>

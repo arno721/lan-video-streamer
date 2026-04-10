@@ -1,0 +1,137 @@
+﻿<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admin</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="admin">
+    <main class="admin-shell">
+      <section class="panel">
+        <div class="title-row">
+          <h1>管理端（SQLite 永久化）</h1>
+          <div class="actions">
+            <a class="btn-secondary" href="/">觀看頁</a>
+            <button id="rescan-btn" type="button">立即重掃</button>
+            <button id="restart-server-btn" type="button" class="btn-secondary">重啟伺服器</button>
+          </div>
+        </div>
+        <ul id="admin-server-urls" class="server-url-list"></ul>
+        <p id="admin-status" class="muted">載入中...</p>
+      </section>
+
+      <section class="panel">
+        <h2>掃描路徑（多路徑）</h2>
+        <div class="path-row">
+          <input id="scan-path-input" type="text" placeholder="例如 D:\\Media" />
+          <button id="add-scan-path" type="button">新增</button>
+        </div>
+        <ul id="scan-path-list" class="path-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>排除路徑（多排除）</h2>
+        <div class="path-row">
+          <input id="exclude-path-input" type="text" placeholder="例如 D:\\Media\\Temp" />
+          <button id="add-exclude-path" type="button">新增</button>
+        </div>
+        <ul id="exclude-path-list" class="path-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>索引摘要</h2>
+        <div id="summary-box" class="summary-box">讀取中...</div>
+      </section>
+
+      <section class="panel">
+        <h2>進階選項</h2>
+        <div class="option-row">
+          <label for="auto-rescan-minutes">自動重掃（分鐘）</label>
+          <input id="auto-rescan-minutes" type="number" min="1" max="1440" step="1" />
+        </div>
+        <div class="option-row">
+          <label for="preview-queue-batch">預覽預熱批量</label>
+          <input id="preview-queue-batch" type="number" min="20" max="5000" step="10" />
+        </div>
+        <div class="type-row">
+          <label><input id="prefer-media-preview" type="checkbox" checked /> 優先只為影片/圖片預覽</label>
+        </div>
+        <div class="type-row">
+          <label><input id="mobile-transcode-first" type="checkbox" checked /> 手機優先即時轉碼（先秒播）</label>
+        </div>
+
+        <div class="option-row">
+          <label for="video-fallback-timeout-ms">影片切換路徑超時（毫秒）</label>
+          <input id="video-fallback-timeout-ms" type="number" min="1000" max="30000" step="100" />
+        </div>
+        <div class="option-row">
+          <label for="video-hold-speed">長按加速倍數</label>
+          <input id="video-hold-speed" type="number" min="1.25" max="8" step="0.05" />
+        </div>
+        <div class="option-row">
+          <label for="video-hold-trigger-ms">長按觸發時間（毫秒）</label>
+          <input id="video-hold-trigger-ms" type="number" min="120" max="1200" step="10" />
+        </div>
+        <div class="option-row">
+          <label for="video-seek-seconds">影片單次快進秒數</label>
+          <input id="video-seek-seconds" type="number" min="1" max="60" step="0.5" />
+        </div>
+        <div class="option-row">
+          <label for="video-seek-seconds-shift">影片大步快進秒數</label>
+          <input id="video-seek-seconds-shift" type="number" min="1" max="180" step="1" />
+        </div>
+
+        <div class="option-row">
+          <label for="image-zoom-mobile">圖片點擊放大倍率（手機）</label>
+          <input id="image-zoom-mobile" type="number" min="1.1" max="4" step="0.05" />
+        </div>
+        <div class="option-row">
+          <label for="image-zoom-desktop">圖片點擊放大倍率（電腦）</label>
+          <input id="image-zoom-desktop" type="number" min="1.1" max="5" step="0.05" />
+        </div>
+
+        <div class="option-row">
+          <label for="transcode-preset">即時轉碼 Preset</label>
+          <select id="transcode-preset">
+            <option value="ultrafast">ultrafast</option>
+            <option value="superfast">superfast</option>
+            <option value="veryfast">veryfast</option>
+            <option value="faster">faster</option>
+            <option value="fast">fast</option>
+            <option value="medium">medium</option>
+          </select>
+        </div>
+        <div class="option-row">
+          <label for="transcode-crf">即時轉碼 CRF</label>
+          <input id="transcode-crf" type="number" min="16" max="35" step="1" />
+        </div>
+        <div class="option-row">
+          <label for="transcode-audio-kbps">音訊位元率（kbps）</label>
+          <input id="transcode-audio-kbps" type="number" min="64" max="320" step="8" />
+        </div>
+        <div class="option-row">
+          <label for="transcode-probe-size">探測大小（bytes）</label>
+          <input id="transcode-probe-size" type="number" min="50000" max="20000000" step="50000" />
+        </div>
+        <div class="option-row">
+          <label for="transcode-analyze-duration">分析時長（ffmpeg us）</label>
+          <input id="transcode-analyze-duration" type="number" min="50000" max="20000000" step="50000" />
+        </div>
+        <div class="option-row">
+          <label for="transcode-keyint">GOP/關鍵幀間隔</label>
+          <input id="transcode-keyint" type="number" min="12" max="360" step="1" />
+        </div>
+        <div class="type-row">
+          <label><input id="transcode-zerolatency" type="checkbox" checked /> 低延遲轉碼模式（zerolatency）</label>
+        </div>
+
+        <div class="actions">
+          <button id="save-options-btn" type="button">保存選項</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/admin.js"></script>
+  </body>
+</html>
