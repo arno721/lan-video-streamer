@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location -Path $root
 
-$inside = [string](git rev-parse --is-inside-work-tree)
+$insideRaw = git rev-parse --is-inside-work-tree
+$inside = if ($null -eq $insideRaw) { "" } else { [string]$insideRaw }
 $inside = $inside.Trim()
 if ($inside -ne "true") {
   throw "Current folder is not a git repository."
@@ -19,7 +20,8 @@ if ($dirty) {
   throw "Working tree is not clean. Please commit or stash changes first."
 }
 
-$branch = [string](git branch --show-current)
+$branchRaw = git branch --show-current
+$branch = if ($null -eq $branchRaw) { "" } else { [string]$branchRaw }
 $branch = $branch.Trim()
 if (-not $branch) {
   throw "Cannot detect current branch."
@@ -33,7 +35,8 @@ if ($normalized -notmatch '^\d+\.\d+\.\d+([\-+][0-9A-Za-z\.-]+)?$') {
 }
 
 $tag = "v$normalized"
-$existingTag = [string](git tag -l $tag)
+$existingTagRaw = git tag -l $tag
+$existingTag = if ($null -eq $existingTagRaw) { "" } else { [string]$existingTagRaw }
 $existingTag = $existingTag.Trim()
 if ($existingTag -eq $tag) {
   throw "Tag already exists: $tag"
