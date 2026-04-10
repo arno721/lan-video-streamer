@@ -47,3 +47,16 @@
 - 若系統有 `ffmpeg`，影片/圖片會生成更真實縮圖。
 - 無 `ffmpeg` 時，仍會生成 SVG 預覽圖。
 - 若防火牆提示，允許 Node.js 私人網路存取。
+
+## 版本發佈（自動安裝包）
+
+已加入版本控制與自動發佈流程：
+
+1. 本機打版（會自動更新版本、commit、tag、push）：
+   - `./scripts/release.ps1 1.0.1`
+2. 推送 `v*` tag 後，GitHub Actions 會自動：
+   - 產生安裝包 ZIP（`dist/lan-video-streamer-vX.Y.Z.zip`）
+   - 建立 GitHub Release 並附上安裝包
+
+手動只打包不發版：
+- `npm run build:installer`

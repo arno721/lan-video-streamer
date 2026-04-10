@@ -4,7 +4,9 @@
   "description": "LAN video streamer with mobile-friendly web UI",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build:installer": "powershell -ExecutionPolicy Bypass -File ./scripts/build-installer.ps1",
+    "release:version": "powershell -ExecutionPolicy Bypass -File ./scripts/release.ps1"
   },
   "dependencies": {
     "compression": "^1.8.1",
