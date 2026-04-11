@@ -7,8 +7,9 @@ $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location -Path $root
 
+$pkg = Get-Content package.json -Raw | ConvertFrom-Json
+
 if (-not $Version) {
-  $pkg = Get-Content package.json -Raw | ConvertFrom-Json
   $Version = [string]$pkg.version
 }
 
@@ -20,9 +21,14 @@ if ($normalized -notmatch '^\d+\.\d+\.\d+([\-+][0-9A-Za-z\.-]+)?$') {
 }
 
 $tagVersion = "v$normalized"
+$artifactBase = [string]$pkg.name
+if (-not $artifactBase) { $artifactBase = "lan-media-hub" }
+$artifactBase = $artifactBase.ToLower() -replace "[^a-z0-9\.\-]+", "-"
+$artifactBase = $artifactBase.Trim("-")
+
 $distDir = Join-Path $root "dist"
-$stageDir = Join-Path $distDir "lan-video-streamer-$tagVersion"
-$zipPath = Join-Path $distDir "lan-video-streamer-$tagVersion.zip"
+$stageDir = Join-Path $distDir "$artifactBase-$tagVersion"
+$zipPath = Join-Path $distDir "$artifactBase-$tagVersion.zip"
 
 if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }

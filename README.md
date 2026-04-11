@@ -1,6 +1,18 @@
-﻿# 內網媒體串流器（SQLite 永久化）
+# LAN Media Hub（內網媒體中心）
 
-已改為資料庫驅動，索引與設定都存到 SQLite，不會因重啟丟失。
+> 優化後項目名稱：`LAN Media Hub`  
+> 優化後簡介：Private LAN media hub with mobile-first web viewer, admin controls, and SQLite persistence.
+
+## 多語言簡介
+
+### 繁體中文
+LAN Media Hub 是一套在內網使用的媒體中心，提供桌面與手機友善的 Web 觀看介面，並透過 SQLite 持久化保存索引與設定，重啟後不會遺失。
+
+### English
+LAN Media Hub is a private LAN media center with desktop and mobile-friendly web viewers. It uses SQLite to persist media index and settings, so data survives restarts.
+
+### 日本語
+LAN Media Hub は、LAN 内で使うプライベートメディアセンターです。PC/モバイル向けの Web ビューアーを備え、SQLite によってインデックスと設定を永続化します。
 
 ## 一鍵啟動
 
@@ -55,7 +67,7 @@
 1. 本機打版（會自動更新版本、commit、tag、push）：
    - `./scripts/release.ps1 1.0.1`
 2. 推送 `v*` tag 後，GitHub Actions 會自動：
-   - 產生安裝包 ZIP（`dist/lan-video-streamer-vX.Y.Z.zip`）
+   - 產生安裝包 ZIP（`dist/<package-name>-vX.Y.Z.zip`）
    - 建立 GitHub Release 並附上安裝包
 
 手動只打包不發版：

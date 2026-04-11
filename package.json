@@ -1,7 +1,7 @@
 {
-  "name": "lan-video-streamer",
+  "name": "lan-media-hub",
   "version": "1.0.1",
-  "description": "LAN video streamer with mobile-friendly web UI",
+  "description": "Private LAN media hub with mobile-first web viewer, admin controls, and SQLite persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
