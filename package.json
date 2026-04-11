@@ -1,6 +1,6 @@
 {
   "name": "lan-media-hub",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Private LAN media hub with mobile-first web viewer, admin controls, and SQLite persistence",
   "main": "server.js",
   "scripts": {
