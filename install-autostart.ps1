@@ -4,10 +4,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$taskName = "LANMediaStreamer_Autostart"
+$taskName = "LANMediaHub_Autostart"
 $launcherPath = Join-Path $PSScriptRoot "startup-launch.ps1"
 $startupDir = [Environment]::GetFolderPath("Startup")
-$startupVbs = Join-Path $startupDir "LANMediaStreamer-Autostart.vbs"
+$startupVbs = Join-Path $startupDir "LANMediaHub-Autostart.vbs"
 
 if (-not (Test-Path $launcherPath)) {
   throw "Missing launcher script: $launcherPath"
@@ -36,7 +36,7 @@ try {
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Auto start LAN Media Streamer at user logon." `
+    -Description "Auto start LAN Media Hub at user logon." `
     -Force | Out-Null
   $created = $true
   $createdMode = "scheduled-task"

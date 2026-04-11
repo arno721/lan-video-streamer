@@ -1952,7 +1952,7 @@ app.listen(PORT, HOST, async () => {
 
   loadSnapshotFromDb();
 
-  console.log("LAN Media Streamer running:");
+  console.log("LAN Media Hub running:");
   console.log(`- Local:   http://localhost:${PORT}`);
   console.log(`- LAN URL: http://${preferredIp}:${PORT}`);
   if (ips.length > 1) {

@@ -16,6 +16,6 @@ if (-not (Test-Path "node_modules")) {
   }
 }
 
-Write-Host "[Info] Starting LAN Media Streamer..."
+Write-Host "[Info] Starting LAN Media Hub..."
 Write-Host "[Info] Open http://localhost:8080/admin.html in browser"
 npm start

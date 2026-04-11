@@ -19,6 +19,6 @@ if not exist node_modules (
   )
 )
 
-echo [Info] Starting LAN Media Streamer...
+echo [Info] Starting LAN Media Hub...
 start "" "http://localhost:8080/admin.html"
 call npm start
