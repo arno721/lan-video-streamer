@@ -8,11 +8,19 @@ const crypto = require("crypto");
 const { Worker } = require("worker_threads");
 const { spawn, spawnSync } = require("child_process");
 const ffmpegStatic = require("ffmpeg-static");
+const sevenZipBin = require("7zip-bin");
 const { DatabaseSync } = require("node:sqlite");
 
 const app = express();
+app.disable("x-powered-by");
+
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = "0.0.0.0";
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const SECURITY_HEADERS = Object.freeze({
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+});
 
 const DEFAULT_MEDIA_DIR = path.join(__dirname, "videos");
 const CACHE_DIR = path.join(__dirname, ".cache");
@@ -22,8 +30,17 @@ const TRANSCODE_DIR = path.join(CACHE_DIR, "transcodes");
 const DB_PATH = path.join(CACHE_DIR, "streamer.db");
 const PREVIEW_WORKER_PATH = path.join(__dirname, "preview-worker.js");
 
-const SCAN_CONCURRENCY = Math.max(4, Math.min(16, Number(process.env.SCAN_CONCURRENCY) || os.cpus().length * 2));
-const PREVIEW_THREADS = Math.max(2, Math.min(8, Number(process.env.PREVIEW_THREADS) || os.cpus().length));
+const CPU_COUNT = Math.max(1, os.cpus().length);
+const DEFAULT_SCAN_CONCURRENCY = Math.max(2, Math.min(8, Math.ceil(CPU_COUNT / 2)));
+const DEFAULT_PREVIEW_THREADS = Math.max(1, Math.min(2, Math.floor(CPU_COUNT / 4) || 1));
+const SCAN_CONCURRENCY = Math.max(
+  1,
+  Math.min(16, readPositiveIntegerOption(process.env.SCAN_CONCURRENCY, DEFAULT_SCAN_CONCURRENCY))
+);
+const PREVIEW_THREADS = Math.max(
+  1,
+  Math.min(8, readPositiveIntegerOption(process.env.PREVIEW_THREADS, DEFAULT_PREVIEW_THREADS))
+);
 const PREVIEW_QUEUE_BATCH = Math.max(50, Number(process.env.PREVIEW_QUEUE_BATCH) || 300);
 const AUTO_RESCAN_MS = Math.max(60000, Number(process.env.AUTO_RESCAN_MS) || 600000);
 const VIDEO_FALLBACK_TIMEOUT_MS = Math.max(1000, Number(process.env.VIDEO_FALLBACK_TIMEOUT_MS) || 7000);
@@ -33,6 +50,7 @@ const VIDEO_SEEK_SECONDS = Math.max(1, Number(process.env.VIDEO_SEEK_SECONDS) ||
 const VIDEO_SEEK_SECONDS_SHIFT = Math.max(1, Number(process.env.VIDEO_SEEK_SECONDS_SHIFT) || 15);
 const IMAGE_ZOOM_MOBILE = Math.max(1.1, Number(process.env.IMAGE_ZOOM_MOBILE) || 1.45);
 const IMAGE_ZOOM_DESKTOP = Math.max(1.1, Number(process.env.IMAGE_ZOOM_DESKTOP) || 1.6);
+const MEDIA_STREAM_HIGH_WATER_MARK = Math.max(64 * 1024, Number(process.env.MEDIA_STREAM_HIGH_WATER_MARK) || 1024 * 1024);
 const TRANSCODE_PRESET = String(process.env.TRANSCODE_PRESET || "veryfast");
 const TRANSCODE_CRF = Math.max(16, Number(process.env.TRANSCODE_CRF) || 22);
 const TRANSCODE_AUDIO_KBPS = Math.max(64, Number(process.env.TRANSCODE_AUDIO_KBPS) || 160);
@@ -40,9 +58,35 @@ const TRANSCODE_PROBE_SIZE = Math.max(50000, Number(process.env.TRANSCODE_PROBE_
 const TRANSCODE_ANALYZE_DURATION = Math.max(50000, Number(process.env.TRANSCODE_ANALYZE_DURATION) || 1000000);
 const TRANSCODE_KEYINT = Math.max(12, Number(process.env.TRANSCODE_KEYINT) || 48);
 const FFMPEG_BIN = process.env.FFMPEG_BIN || ffmpegStatic || "ffmpeg";
+const ARCHIVE_LIST_BIN = process.env.ARCHIVE_LIST_BIN || findArchiveListBin();
 const RESCAN_TICK_MS = 30000;
 const DIRECT_PLAYABLE_VIDEO_EXTENSIONS = new Set([".mp4", ".m4v", ".webm"]);
 const TRANSCODE_PRESET_VALUES = new Set(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"]);
+const ARCHIVE_PREVIEW_MAX_ENTRIES = Math.max(100, Number(process.env.ARCHIVE_PREVIEW_MAX_ENTRIES) || 5000);
+const ARCHIVE_PREVIEW_STDOUT_LIMIT = Math.max(1024 * 1024, Number(process.env.ARCHIVE_PREVIEW_STDOUT_LIMIT) || 12 * 1024 * 1024);
+const ARCHIVE_PREVIEW_TIMEOUT_MS = Math.max(3000, Number(process.env.ARCHIVE_PREVIEW_TIMEOUT_MS) || 20000);
+const ARCHIVE_COVER_TIMEOUT_MS = Math.max(300, Number(process.env.ARCHIVE_COVER_TIMEOUT_MS) || 900);
+const ARCHIVE_COVER_STDOUT_LIMIT = Math.max(256 * 1024, Number(process.env.ARCHIVE_COVER_STDOUT_LIMIT) || 2 * 1024 * 1024);
+const ARCHIVE_COVER_EXTRACT_TIMEOUT_MS = Math.max(3000, Number(process.env.ARCHIVE_COVER_EXTRACT_TIMEOUT_MS) || 15000);
+const ARCHIVE_COVER_EXTRACT_MAX_BYTES = Math.max(1024 * 1024, Number(process.env.ARCHIVE_COVER_EXTRACT_MAX_BYTES) || 30 * 1024 * 1024);
+
+function findArchiveListBin() {
+  for (const candidate of ["7z", "7za"]) {
+    try {
+      const result = spawnSync(candidate, ["-h"], { stdio: "ignore", windowsHide: true });
+      if (result.status === 0) return candidate;
+    } catch {
+      // continue to bundled 7za
+    }
+  }
+  return sevenZipBin.path7za || "7z";
+}
+
+function readPositiveIntegerOption(raw, fallback) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.round(value);
+}
 
 const RUNTIME_OPTION_DEFAULTS = Object.freeze({
   autoRescanMs: AUTO_RESCAN_MS,
@@ -96,7 +140,7 @@ const EXT_CATEGORY = {
   image: new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic"]),
   audio: new Set([".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"]),
   document: new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".md"]),
-  archive: new Set([".zip", ".rar", ".7z", ".tar", ".gz"]),
+  archive: new Set([".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz"]),
   code: new Set([".js", ".ts", ".tsx", ".jsx", ".json", ".py", ".go", ".java", ".cs", ".cpp", ".c", ".rs", ".html", ".css"]),
 };
 
@@ -129,6 +173,7 @@ const MIME_BY_EXT = {
   ".bmp": "image/bmp",
   ".avif": "image/avif",
   ".heic": "image/heic",
+  ".svg": "image/svg+xml; charset=utf-8",
   ".mp3": "audio/mpeg",
   ".wav": "audio/wav",
   ".flac": "audio/flac",
@@ -466,8 +511,6 @@ function createTreeNode(name, nodePath) {
 function createEmptySnapshot() {
   return {
     generation: 0,
-    scanPaths: getScanPaths(),
-    excludePaths: getExcludePaths(),
     totalItems: 0,
     totalSize: 0,
     byCategory: {
@@ -498,6 +541,8 @@ let librarySnapshot = createEmptySnapshot();
 let itemLookup = new Map();
 let folderItemsLookup = new Map();
 let previewCache = new Map();
+const archivePreviewCache = new Map();
+const archiveCoverCache = new Map();
 const pendingTranscodeJobs = new Map();
 let indexState = {
   isIndexing: false,
@@ -517,6 +562,10 @@ const pendingFrameJobs = new Map();
 const previewQueue = [];
 const previewQueuedKeys = new Set();
 const pendingPreviewJobs = new Map();
+let previewQueueOrder = 0;
+const pendingArchivePreviewJobs = new Map();
+const pendingArchiveCoverJobs = new Map();
+const pendingArchiveCoverExtractJobs = new Map();
 
 function buildPreviewJob(item) {
   return {
@@ -533,19 +582,69 @@ function buildPreviewJob(item) {
   };
 }
 
-function enqueuePreviewJob(item) {
+function enqueuePreviewJob(item, options = {}) {
+  return enqueuePreviewJobWithOptions(item, options);
+}
+
+function sortPreviewQueue() {
+  previewQueue.sort((a, b) => {
+    const priorityDiff = Number(b.priority || 0) - Number(a.priority || 0);
+    if (priorityDiff !== 0) return priorityDiff;
+    return Number(a.queuedOrder || 0) - Number(b.queuedOrder || 0);
+  });
+}
+
+function previewWorkerResultToCacheEntry(record, result) {
+  if (!result || !result.ok || !result.outputPath || !fs.existsSync(result.outputPath)) return null;
+  return {
+    previewKey: record.previewKey,
+    outputPath: result.outputPath,
+    mimeType: result.mimeType || "image/jpeg",
+    updatedAt: Date.now(),
+  };
+}
+
+function enqueuePreviewJobWithOptions(item, options = {}) {
+  if (!item) return Promise.resolve(null);
   const queueKey = `${item.id}|${item.previewKey}`;
-  if (previewQueuedKeys.has(queueKey)) return;
+  const priority = Number(options.priority || 0);
+  const existing = pendingPreviewJobs.get(queueKey);
+  if (existing) {
+    if (!existing.started && priority > existing.priority) {
+      existing.priority = priority;
+      sortPreviewQueue();
+    }
+    return existing.promise;
+  }
+
+  let resolveJob;
+  const promise = new Promise((resolve) => {
+    resolveJob = resolve;
+  });
+
+  const job = buildPreviewJob(item);
+  const record = {
+    queueKey,
+    itemId: job.itemId,
+    previewKey: job.previewKey,
+    priority,
+    queuedOrder: previewQueueOrder,
+    started: false,
+    job,
+    promise,
+    resolve: resolveJob,
+  };
+  previewQueueOrder += 1;
 
   previewQueuedKeys.add(queueKey);
-  previewQueue.push({
-    queueKey,
-    ...buildPreviewJob(item),
-  });
+  pendingPreviewJobs.set(queueKey, record);
+  previewQueue.push(record);
+  sortPreviewQueue();
 
   previewState.queued = previewQueue.length;
   previewState.totalQueuedThisRound += 1;
   pumpPreviewQueue();
+  return promise;
 }
 
 function runPreviewWorker(job) {
@@ -562,26 +661,24 @@ function runPreviewWorker(job) {
 
 function pumpPreviewQueue() {
   while (previewState.active < PREVIEW_THREADS && previewQueue.length > 0) {
-    const job = previewQueue.shift();
+    const record = previewQueue.shift();
+    record.started = true;
     previewState.active += 1;
     previewState.queued = previewQueue.length;
 
-    runPreviewWorker(job)
+    runPreviewWorker(record.job)
       .then((result) => {
-        if (result && result.ok && result.outputPath) {
-          previewCache.set(job.itemId, {
-            previewKey: job.previewKey,
-            outputPath: result.outputPath,
-            mimeType: result.mimeType,
-            updatedAt: Date.now(),
-          });
-        }
+        const entry = previewWorkerResultToCacheEntry(record, result);
+        if (entry) previewCache.set(record.itemId, entry);
+        record.resolve(entry);
       })
       .catch(() => {
         // Keep fallback preview.
+        record.resolve(null);
       })
       .finally(() => {
-        previewQueuedKeys.delete(job.queueKey);
+        previewQueuedKeys.delete(record.queueKey);
+        pendingPreviewJobs.delete(record.queueKey);
         previewState.active -= 1;
         previewState.finishedThisRound += 1;
         previewState.queued = previewQueue.length;
@@ -592,33 +689,631 @@ function pumpPreviewQueue() {
 
 async function generatePreviewNow(item) {
   if (!item) return null;
+  return enqueuePreviewJob(item, { priority: 100, waitForResult: true });
+}
 
-  const jobKey = `${item.id}|${item.previewKey}`;
-  if (pendingPreviewJobs.has(jobKey)) {
-    return pendingPreviewJobs.get(jobKey);
+function archiveEntryFromSevenZipRecord(record) {
+  if (!record || !record.Path) return null;
+  const entryPath = String(record.Path || "").replace(/\\/g, "/");
+  if (!entryPath || entryPath === "." || entryPath.endsWith(":/")) return null;
+
+  const attr = String(record.Attributes || "");
+  const isDirectory = attr.includes("D") || entryPath.endsWith("/");
+  return {
+    path: entryPath,
+    name: entryPath.split("/").filter(Boolean).pop() || entryPath,
+    directory: isDirectory,
+    size: isDirectory ? 0 : Math.max(0, Number(record.Size) || 0),
+    packedSize: Math.max(0, Number(record["Packed Size"]) || 0),
+    modifiedAt: record.Modified || null,
+    encrypted: String(record.Encrypted || "").trim() === "+",
+  };
+}
+
+function parseSevenZipList(text, maxEntries = ARCHIVE_PREVIEW_MAX_ENTRIES) {
+  const entries = [];
+  let current = null;
+  let truncated = false;
+
+  const flush = () => {
+    const entry = archiveEntryFromSevenZipRecord(current);
+    if (!entry) return;
+    if (entries.length >= maxEntries) {
+      truncated = true;
+      return;
+    }
+    entries.push(entry);
+  };
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line) {
+      flush();
+      current = null;
+      continue;
+    }
+
+    const idx = line.indexOf(" = ");
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 3).trim();
+    if (key === "Path") {
+      flush();
+      current = { Path: value };
+    } else if (current) {
+      current[key] = value;
+    }
+  }
+  flush();
+
+  entries.sort((a, b) => {
+    if (a.directory !== b.directory) return a.directory ? -1 : 1;
+    return a.path.localeCompare(b.path, "zh-Hant", { numeric: true, sensitivity: "base" });
+  });
+
+  return { entries, truncated };
+}
+
+function buildArchiveSummary(entries) {
+  return entries.reduce(
+    (acc, entry) => {
+      if (entry.directory) acc.directories += 1;
+      else {
+        acc.files += 1;
+        acc.totalSize += Number(entry.size || 0);
+      }
+      if (entry.encrypted) acc.encrypted += 1;
+      return acc;
+    },
+    { files: 0, directories: 0, totalSize: 0, encrypted: 0 }
+  );
+}
+
+function archiveEntryId(archiveItem, entryPath) {
+  return `archive-entry:${archiveItem.id}:${Buffer.from(String(entryPath || ""), "utf8").toString("base64url")}`;
+}
+
+function archiveEntryQuery(archiveItem, entryPath) {
+  return `id=${encodeURIComponent(archiveItem.id)}&entry=${encodeURIComponent(entryPath)}`;
+}
+
+function archiveEntryPreviewKey(archiveItem, entryPath) {
+  const hash = crypto.createHash("sha1").update(`${archiveItem.previewKey}|${entryPath}`).digest("hex").slice(0, 16);
+  return `archive_${archiveItem.id}_${hash}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function toArchiveEntryClientItem(archiveItem, entry) {
+  const entryPath = String(entry?.path || "");
+  const name = String(entry?.name || path.posix.basename(entryPath) || "file");
+  const extension = path.posix.extname(name).toLowerCase();
+  const category = getCategory(extension);
+  const mediaUrl = `/api/archive-media?${archiveEntryQuery(archiveItem, entryPath)}`;
+  const previewUrl =
+    category === "video"
+      ? `/api/archive-video-frame?${archiveEntryQuery(archiveItem, entryPath)}`
+      : category === "image"
+        ? mediaUrl
+        : `/api/archive-entry-preview?${archiveEntryQuery(archiveItem, entryPath)}`;
+
+  return {
+    id: archiveEntryId(archiveItem, entryPath),
+    archiveId: archiveItem.id,
+    archiveEntryPath: entryPath,
+    relativePath: entryPath,
+    displayFolder: `壓縮包: ${archiveItem.name}`,
+    name,
+    extension,
+    category,
+    size: Number(entry.size || 0),
+    updatedAt: entry.modifiedAt || archiveItem.updatedAt,
+    displayPath: `${archiveItem.displayPath || archiveItem.name} / ${entryPath}`,
+    previewKey: archiveEntryPreviewKey(archiveItem, entryPath),
+    mediaUrl,
+    transcodeUrl: mediaUrl,
+    transcodeFileUrl: mediaUrl,
+    downloadUrl: `${mediaUrl}&download=1`,
+    previewUrl,
+    directPlayPreferred: true,
+    sourceArchiveId: archiveItem.id,
+  };
+}
+
+function getArchiveEntryFromPreview(preview, entryPath) {
+  const normalized = String(entryPath || "").replace(/\\/g, "/");
+  return (preview?.entries || []).find((entry) => entry.path === normalized) || null;
+}
+
+function listArchiveWithSevenZip(item) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let outputTruncated = false;
+    let finished = false;
+
+    const child = spawn(ARCHIVE_LIST_BIN, ["l", "-slt", "-sccUTF-8", "-ba", item.sourcePath], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timer = setTimeout(() => {
+      if (finished) return;
+      outputTruncated = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore cleanup kill failure
+      }
+    }, ARCHIVE_PREVIEW_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk) => {
+      if (outputTruncated) return;
+      stdout += chunk.toString("utf8");
+      if (stdout.length > ARCHIVE_PREVIEW_STDOUT_LIMIT) {
+        outputTruncated = true;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore cleanup kill failure
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length > 4096) return;
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (err) => {
+      finished = true;
+      clearTimeout(timer);
+      reject(new Error(`archive preview tool failed: ${err.message || "spawn failed"}`));
+    });
+
+    child.on("close", (code) => {
+      finished = true;
+      clearTimeout(timer);
+      const parsed = parseSevenZipList(stdout);
+      if (code !== 0 && parsed.entries.length === 0) {
+        const detail = stderr.trim() || `exit code ${code}`;
+        reject(new Error(`archive preview failed: ${detail}`));
+        return;
+      }
+      resolve({
+        ...parsed,
+        truncated: parsed.truncated || outputTruncated,
+      });
+    });
+  });
+}
+
+function listArchiveCoverWithSevenZip(item) {
+  return new Promise((resolve) => {
+    let stdoutSize = 0;
+    let buffer = "";
+    let current = null;
+    let settled = false;
+
+    const child = spawn(ARCHIVE_LIST_BIN, ["l", "-slt", "-sccUTF-8", "-ba", item.sourcePath], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const finish = (entry = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore cleanup kill failure
+      }
+      resolve(entry);
+    };
+
+    const considerCurrent = () => {
+      const entry = archiveEntryFromSevenZipRecord(current);
+      current = null;
+      if (!entry || entry.directory || entry.encrypted) return;
+      if (getCategory(path.posix.extname(entry.name || entry.path || "")) === "image") finish(entry);
+    };
+
+    const processLine = (rawLine) => {
+      const line = String(rawLine || "").trimEnd();
+      if (!line) {
+        considerCurrent();
+        return;
+      }
+      const idx = line.indexOf(" = ");
+      if (idx < 0) return;
+      const key = line.slice(0, idx).trim();
+      const value = line.slice(idx + 3).trim();
+      if (key === "Path") {
+        considerCurrent();
+        current = { Path: value };
+      } else if (current) {
+        current[key] = value;
+      }
+    };
+
+    const timer = setTimeout(() => finish(null), ARCHIVE_COVER_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      stdoutSize += chunk.length;
+      if (stdoutSize > ARCHIVE_COVER_STDOUT_LIMIT) {
+        finish(null);
+        return;
+      }
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        processLine(line);
+        if (settled) return;
+      }
+    });
+
+    child.on("error", () => finish(null));
+    child.on("close", () => {
+      if (settled) return;
+      if (buffer) processLine(buffer);
+      considerCurrent();
+      finish(null);
+    });
+  });
+}
+
+async function getArchivePreview(item) {
+  if (!item || item.category !== "archive") return null;
+  const cacheKey = `${item.id}|${item.previewKey}`;
+  const cached = archivePreviewCache.get(cacheKey);
+  if (cached) return cached;
+  if (pendingArchivePreviewJobs.has(cacheKey)) return pendingArchivePreviewJobs.get(cacheKey);
+
+  const task = listArchiveWithSevenZip(item)
+    .then((result) => {
+      const preview = {
+        item: toClientItem(item),
+        entries: result.entries,
+        items: result.entries
+          .filter((entry) => !entry.directory)
+          .map((entry) => toArchiveEntryClientItem(item, entry)),
+        summary: buildArchiveSummary(result.entries),
+        truncated: !!result.truncated,
+        generatedAt: new Date().toISOString(),
+      };
+      archivePreviewCache.set(cacheKey, preview);
+      const coverItem = preview.items.find((entryItem) => entryItem.category === "image") || null;
+      if (coverItem) archiveCoverCache.set(cacheKey, coverItem);
+      return preview;
+    })
+    .finally(() => {
+      pendingArchivePreviewJobs.delete(cacheKey);
+    });
+
+  pendingArchivePreviewJobs.set(cacheKey, task);
+  return task;
+}
+
+async function getArchiveCoverPreview(item) {
+  if (!item || item.category !== "archive") return null;
+  const cacheKey = `${item.id}|${item.previewKey}`;
+  if (archiveCoverCache.has(cacheKey)) return archiveCoverCache.get(cacheKey);
+  if (pendingArchiveCoverJobs.has(cacheKey)) return pendingArchiveCoverJobs.get(cacheKey);
+
+  const task = listArchiveCoverWithSevenZip(item)
+    .then((entry) => {
+      const coverItem = entry ? toArchiveEntryClientItem(item, entry) : null;
+      archiveCoverCache.set(cacheKey, coverItem);
+      return coverItem;
+    })
+    .finally(() => {
+      pendingArchiveCoverJobs.delete(cacheKey);
+    });
+
+  pendingArchiveCoverJobs.set(cacheKey, task);
+  return task;
+}
+
+function getArchiveCoverPreviewOutputPath(item, coverItem) {
+  const rawExt = String(coverItem?.extension || "").toLowerCase();
+  const ext = EXT_CATEGORY.image.has(rawExt) ? rawExt : ".jpg";
+  return path.join(PREVIEW_DIR, `${item.previewKey}${ext}`);
+}
+
+function extractArchiveCoverToFile(item, coverItem, outputPath) {
+  return new Promise((resolve, reject) => {
+    ensureDir(PREVIEW_DIR);
+    const tempPath = `${outputPath}.${process.pid}.${Date.now()}.tmp`;
+    const out = fs.createWriteStream(tempPath);
+    const child = spawn(ARCHIVE_LIST_BIN, ["x", "-so", "-sccUTF-8", item.sourcePath, coverItem.archiveEntryPath], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+    let settled = false;
+    let written = 0;
+    const cleanupTemp = () => {
+      try {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      } catch {
+        // ignore cleanup failure
+      }
+    };
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) {
+        cleanupTemp();
+        reject(err);
+        return;
+      }
+      try {
+        fs.renameSync(tempPath, outputPath);
+        resolve(outputPath);
+      } catch (renameErr) {
+        cleanupTemp();
+        reject(renameErr);
+      }
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      finish(new Error("archive cover extraction timed out"));
+    }, ARCHIVE_COVER_EXTRACT_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk) => {
+      written += chunk.length;
+      if (written > ARCHIVE_COVER_EXTRACT_MAX_BYTES) {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        finish(new Error("archive cover extraction exceeded size limit"));
+      }
+    });
+    child.stdout.pipe(out);
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length > 4096) return;
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (err) => finish(err));
+    out.on("error", (err) => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      finish(err);
+    });
+    child.on("close", (code) => {
+      out.end(() => {
+        if (code === 0 && fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) {
+          finish(null);
+          return;
+        }
+        finish(new Error(stderr.trim() || `archive cover extraction failed (${code})`));
+      });
+    });
+  });
+}
+
+async function ensureArchiveCoverPreviewCached(item, coverItem) {
+  if (!item || !coverItem || coverItem.category !== "image" || !coverItem.archiveEntryPath) return null;
+
+  const outputPath = getArchiveCoverPreviewOutputPath(item, coverItem);
+  if (fs.existsSync(outputPath)) {
+    const stat = fs.statSync(outputPath);
+    if (stat.size > 0) {
+      const entry = {
+        previewKey: item.previewKey,
+        outputPath,
+        mimeType: getMimeType(path.extname(outputPath).toLowerCase()),
+        updatedAt: Date.now(),
+      };
+      previewCache.set(item.id, entry);
+      return entry;
+    }
   }
 
-  const task = runPreviewWorker(buildPreviewJob(item))
-    .then((result) => {
-      if (result && result.ok && result.outputPath && fs.existsSync(result.outputPath)) {
-        const entry = {
-          previewKey: item.previewKey,
-          outputPath: result.outputPath,
-          mimeType: result.mimeType || "image/jpeg",
-          updatedAt: Date.now(),
-        };
-        previewCache.set(item.id, entry);
-        return entry;
-      }
-      return null;
+  const jobKey = `${item.id}|${item.previewKey}|${coverItem.archiveEntryPath}`;
+  if (pendingArchiveCoverExtractJobs.has(jobKey)) return pendingArchiveCoverExtractJobs.get(jobKey);
+
+  const task = extractArchiveCoverToFile(item, coverItem, outputPath)
+    .then(() => {
+      const entry = {
+        previewKey: item.previewKey,
+        outputPath,
+        mimeType: getMimeType(path.extname(outputPath).toLowerCase()),
+        updatedAt: Date.now(),
+      };
+      previewCache.set(item.id, entry);
+      return entry;
     })
     .catch(() => null)
     .finally(() => {
-      pendingPreviewJobs.delete(jobKey);
+      pendingArchiveCoverExtractJobs.delete(jobKey);
     });
 
-  pendingPreviewJobs.set(jobKey, task);
+  pendingArchiveCoverExtractJobs.set(jobKey, task);
   return task;
+}
+
+function queueArchiveCoverUpgrade(item) {
+  if (!item || item.category !== "archive" || !fs.existsSync(item.sourcePath)) return;
+  getArchiveCoverPreview(item)
+    .then((coverItem) => ensureArchiveCoverPreviewCached(item, coverItem))
+    .catch(() => null);
+}
+
+async function getArchiveEntryForRequest(req, res) {
+  const id = String(req.query.id || "").trim();
+  const entryPath = String(req.query.entry || "").trim();
+  if (!id || !entryPath) {
+    res.status(400).json({ error: "id and entry are required" });
+    return null;
+  }
+
+  const archiveItem = getItemById(id);
+  if (!archiveItem || archiveItem.category !== "archive" || !fs.existsSync(archiveItem.sourcePath)) {
+    res.status(404).json({ error: "archive not found" });
+    return null;
+  }
+
+  const preview = await getArchivePreview(archiveItem);
+  const entry = getArchiveEntryFromPreview(preview, entryPath);
+  if (!entry || entry.directory) {
+    res.status(404).json({ error: "archive entry not found" });
+    return null;
+  }
+
+  const item = toArchiveEntryClientItem(archiveItem, entry);
+  return { archiveItem, entry, item };
+}
+
+function streamArchiveEntry(archiveItem, entry, res, opt = {}) {
+  const entryPath = String(entry.path || "");
+  const name = String(entry.name || path.posix.basename(entryPath) || "file");
+  const extension = path.posix.extname(name).toLowerCase();
+  const mimeType = getMimeType(extension);
+
+  res.status(200);
+  res.setHeader("Content-Type", mimeType);
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Accept-Ranges", "none");
+  if (opt.download) {
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+  }
+
+  const child = spawn(ARCHIVE_LIST_BIN, ["x", "-so", "-sccUTF-8", archiveItem.sourcePath, entryPath], {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stderr = "";
+  const closeChild = () => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // ignore cleanup kill failure
+    }
+  };
+
+  res.on("close", closeChild);
+  child.stderr.on("data", (chunk) => {
+    if (stderr.length > 4096) return;
+    stderr += chunk.toString("utf8");
+  });
+  child.on("error", (err) => {
+    if (!res.headersSent) res.status(500).json({ error: err.message || "archive entry stream failed" });
+    else if (!res.writableEnded) res.end();
+  });
+  child.on("close", (code) => {
+    res.off("close", closeChild);
+    if (code !== 0 && !res.headersSent) {
+      res.status(500).json({ error: stderr.trim() || `archive entry stream failed (${code})` });
+      return;
+    }
+    if (!res.writableEnded) res.end();
+  });
+
+  child.stdout.pipe(res);
+}
+
+function generateArchiveVideoFrame(archiveItem, entry, frameItem) {
+  const jobKey = `${frameItem.previewKey}|archive-frame-buffer`;
+  if (pendingFrameJobs.has(jobKey)) return pendingFrameJobs.get(jobKey);
+
+  const job = new Promise((resolve, reject) => {
+    const extract = spawn(ARCHIVE_LIST_BIN, ["x", "-so", "-sccUTF-8", archiveItem.sourcePath, entry.path], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ffmpeg = spawn(
+      FFMPEG_BIN,
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "pipe:0",
+        "-ss",
+        "1",
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=640:-1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+      ],
+      { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    let stderr = "";
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const killBoth = () => {
+      try {
+        extract.kill("SIGKILL");
+      } catch {}
+      try {
+        ffmpeg.kill("SIGKILL");
+      } catch {}
+    };
+    const finish = (err, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(buffer);
+    };
+    const timer = setTimeout(() => {
+      killBoth();
+      finish(new Error("archive video frame timed out"));
+    }, 20000);
+
+    extract.stdout.pipe(ffmpeg.stdin);
+    extract.on("error", (err) => {
+      killBoth();
+      finish(err);
+    });
+    ffmpeg.stdout.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > 4 * 1024 * 1024) {
+        killBoth();
+        finish(new Error("archive video frame too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    ffmpeg.stderr.on("data", (chunk) => {
+      if (stderr.length > 4096) return;
+      stderr += chunk.toString("utf8");
+    });
+    ffmpeg.on("error", (err) => {
+      killBoth();
+      finish(err);
+    });
+    ffmpeg.on("close", (code) => {
+      if (settled) return;
+      if (code === 0 && size > 0) {
+        finish(null, Buffer.concat(chunks, size));
+        return;
+      }
+      finish(new Error(stderr.trim() || `archive video frame failed (${code})`));
+    });
+  }).finally(() => {
+    pendingFrameJobs.delete(jobKey);
+  });
+
+  pendingFrameJobs.set(jobKey, job);
+  return job;
 }
 
 async function scanAllFiles(scanPaths, excludePaths) {
@@ -744,6 +1439,9 @@ function toClientItem(item) {
     downloadUrl: item.downloadUrl,
     previewUrl: item.previewUrl,
     directPlayPreferred: item.directPlayPreferred,
+    archiveId: item.archiveId,
+    archiveEntryPath: item.archiveEntryPath,
+    sourceArchiveId: item.sourceArchiveId,
   };
 }
 
@@ -885,6 +1583,17 @@ function buildSnapshotFromItems(items) {
       }
     }
 
+    let sampleArchive = node.items.find((item) => item.category === "archive") || null;
+    if (!sampleArchive) {
+      const firstChildWithArchive = children.find((child) => child.sampleArchiveItemId);
+      if (firstChildWithArchive) {
+        sampleArchive = {
+          id: firstChildWithArchive.sampleArchiveItemId,
+          category: "archive",
+        };
+      }
+    }
+
     return {
       id: node.id,
       name: node.name,
@@ -895,6 +1604,7 @@ function buildSnapshotFromItems(items) {
       sampleCategory: sampleAny ? sampleAny.category : null,
       sampleMediaItemId: sampleMedia ? sampleMedia.id : null,
       sampleMediaCategory: sampleMedia ? sampleMedia.category : null,
+      sampleArchiveItemId: sampleArchive ? sampleArchive.id : null,
       children,
     };
   }
@@ -923,8 +1633,6 @@ function loadSnapshotFromDb() {
   folderItemsLookup = summary.folderItems;
   librarySnapshot = {
     generation: indexState.generation,
-    scanPaths: getScanPaths(),
-    excludePaths: getExcludePaths(),
     totalItems: summary.totalItems,
     totalSize: summary.totalSize,
     byCategory: summary.byCategory,
@@ -1028,14 +1736,17 @@ async function triggerRescan(reason = "manual") {
         const score = (category) => {
           if (category === "image") return 4;
           if (category === "video") return 3;
-          if (category === "audio") return 2;
+          if (category === "archive") return 2;
+          if (category === "audio") return 1.5;
           return 1;
         };
         return score(b.category) - score(a.category);
       });
 
     if (runtimeOptions.preferMediaFolderPreview) {
-      warmItems = warmItems.filter((item) => item.category === "video" || item.category === "image");
+      warmItems = warmItems.filter(
+        (item) => item.category === "video" || item.category === "image" || item.category === "archive"
+      );
     }
 
     warmItems = warmItems.slice(0, runtimeOptions.previewQueueBatch);
@@ -1060,24 +1771,57 @@ async function triggerRescan(reason = "manual") {
   }
 }
 
+function startRescan(reason = "manual") {
+  const wasIndexing = indexState.isIndexing;
+  triggerRescan(reason).catch(() => {
+    // triggerRescan records failures in indexState.lastError.
+  });
+  return {
+    accepted: true,
+    indexing: indexState.isIndexing || wasIndexing,
+    pending: pendingRescan,
+    generation: indexState.generation,
+  };
+}
+
+function getIndexStatus() {
+  return {
+    isIndexing: indexState.isIndexing,
+    startedAt: indexState.startedAt,
+    finishedAt: indexState.finishedAt,
+    lastError: indexState.lastError,
+    generation: indexState.generation,
+    pendingRescan,
+  };
+}
+
+function getPreviewStatus() {
+  return {
+    active: previewState.active,
+    queued: previewState.queued,
+    totalQueuedThisRound: previewState.totalQueuedThisRound,
+    finishedThisRound: previewState.finishedThisRound,
+    ffmpegEnabled: supportsFfmpeg,
+    threads: PREVIEW_THREADS,
+  };
+}
+
+function getStatusResponse() {
+  return {
+    generation: librarySnapshot.generation,
+    totalItems: librarySnapshot.totalItems,
+    totalSize: librarySnapshot.totalSize,
+    generatedAt: librarySnapshot.generatedAt,
+    index: getIndexStatus(),
+    preview: getPreviewStatus(),
+  };
+}
+
 function getLibraryResponse() {
   return {
     ...librarySnapshot,
-    index: {
-      isIndexing: indexState.isIndexing,
-      startedAt: indexState.startedAt,
-      finishedAt: indexState.finishedAt,
-      lastError: indexState.lastError,
-      generation: indexState.generation,
-    },
-    preview: {
-      active: previewState.active,
-      queued: previewState.queued,
-      totalQueuedThisRound: previewState.totalQueuedThisRound,
-      finishedThisRound: previewState.finishedThisRound,
-      ffmpegEnabled: supportsFfmpeg,
-      threads: PREVIEW_THREADS,
-    },
+    index: getIndexStatus(),
+    preview: getPreviewStatus(),
   };
 }
 
@@ -1124,7 +1868,7 @@ function streamWithRange(filePath, mimeType, req, res) {
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
     });
-    fs.createReadStream(filePath).pipe(res);
+    fs.createReadStream(filePath, { highWaterMark: MEDIA_STREAM_HIGH_WATER_MARK }).pipe(res);
     return;
   }
 
@@ -1153,7 +1897,7 @@ function streamWithRange(filePath, mimeType, req, res) {
     "Cache-Control": "no-store",
   });
 
-  fs.createReadStream(filePath, { start, end }).pipe(res);
+  fs.createReadStream(filePath, { start, end, highWaterMark: MEDIA_STREAM_HIGH_WATER_MARK }).pipe(res);
 }
 
 function streamWholeFile(filePath, mimeType, res) {
@@ -1163,7 +1907,7 @@ function streamWholeFile(filePath, mimeType, res) {
     "Content-Type": mimeType,
     "Cache-Control": "no-store",
   });
-  fs.createReadStream(filePath).pipe(res);
+  fs.createReadStream(filePath, { highWaterMark: MEDIA_STREAM_HIGH_WATER_MARK }).pipe(res);
 }
 
 function sendMedia(item, req, res) {
@@ -1196,6 +1940,13 @@ function streamVideoTranscode(item, req, res) {
     return;
   }
 
+  const liveTranscodePreset =
+    runtimeOptions.transcodePreset === "ultrafast" || runtimeOptions.transcodePreset === "superfast"
+      ? runtimeOptions.transcodePreset
+      : "superfast";
+  const liveProbeSize = Math.max(50000, Math.min(Number(runtimeOptions.transcodeProbeSize) || 50000, 400000));
+  const liveAnalyzeDuration = Math.max(50000, Math.min(Number(runtimeOptions.transcodeAnalyzeDuration) || 50000, 400000));
+
   const args = [
     "-hide_banner",
     "-loglevel",
@@ -1203,9 +1954,9 @@ function streamVideoTranscode(item, req, res) {
     "-fflags",
     "+genpts",
     "-probesize",
-    String(runtimeOptions.transcodeProbeSize),
+    String(liveProbeSize),
     "-analyzeduration",
-    String(runtimeOptions.transcodeAnalyzeDuration),
+    String(liveAnalyzeDuration),
     "-i",
     item.sourcePath,
     "-map",
@@ -1217,7 +1968,7 @@ function streamVideoTranscode(item, req, res) {
     "-c:v",
     "libx264",
     "-preset",
-    runtimeOptions.transcodePreset,
+    liveTranscodePreset,
   ];
 
   if (runtimeOptions.transcodeTuneZerolatency) {
@@ -1416,17 +2167,36 @@ function fallbackPreviewSvg(item) {
 </svg>`;
 }
 
+function ensureFallbackPreviewCached(item) {
+  if (!item?.previewKey) return null;
+  try {
+    ensureDir(PREVIEW_DIR);
+    const outputPath = path.join(PREVIEW_DIR, `${item.previewKey}.svg`);
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size <= 0) {
+      fs.writeFileSync(outputPath, fallbackPreviewSvg(item), "utf8");
+    }
+    const entry = {
+      previewKey: item.previewKey,
+      outputPath,
+      mimeType: "image/svg+xml",
+      updatedAt: Date.now(),
+    };
+    previewCache.set(item.id, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
 function getPreviewFileByKey(previewKey) {
   if (!previewKey) return null;
 
-  const jpg = path.join(PREVIEW_DIR, `${previewKey}.jpg`);
-  if (fs.existsSync(jpg) && fs.statSync(jpg).size > 0) {
-    return { outputPath: jpg, mimeType: "image/jpeg" };
-  }
-
-  const svg = path.join(PREVIEW_DIR, `${previewKey}.svg`);
-  if (fs.existsSync(svg) && fs.statSync(svg).size > 0) {
-    return { outputPath: svg, mimeType: "image/svg+xml" };
+  const candidates = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic", ".svg"];
+  for (const ext of candidates) {
+    const filePath = path.join(PREVIEW_DIR, `${previewKey}${ext}`);
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+      return { outputPath: filePath, mimeType: getMimeType(ext) };
+    }
   }
 
   return null;
@@ -1503,6 +2273,42 @@ async function generateScrubFrame(item, second) {
   return job;
 }
 
+function isSameOriginRequest(req) {
+  const origin = String(req.headers.origin || "");
+  if (!origin) return true;
+
+  const host = String(req.headers.host || "").toLowerCase();
+  if (!host) return false;
+
+  try {
+    return new URL(origin).host.toLowerCase() === host;
+  } catch {
+    return false;
+  }
+}
+
+function rejectCrossOriginUnsafeRequests(req, res, next) {
+  if (!UNSAFE_METHODS.has(req.method) || !req.path.startsWith("/api/")) {
+    next();
+    return;
+  }
+
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  if (fetchSite === "cross-site" || !isSameOriginRequest(req)) {
+    res.status(403).json({ error: "cross-origin requests are not allowed" });
+    return;
+  }
+
+  next();
+}
+
+app.use((req, res, next) => {
+  for (const [header, value] of Object.entries(SECURITY_HEADERS)) {
+    res.setHeader(header, value);
+  }
+  next();
+});
+app.use(rejectCrossOriginUnsafeRequests);
 app.use(express.json({ limit: "1mb" }));
 app.use(compression());
 app.use((req, res, next) => {
@@ -1631,9 +2437,9 @@ app.post("/api/scan-paths", async (req, res) => {
 
     const now = new Date().toISOString();
     insertScanPathStmt.run(resolved, now, now);
-    await triggerRescan("add-scan-path");
+    const rescan = startRescan("add-scan-path");
 
-    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths() });
+    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths(), rescan });
   } catch (err) {
     res.status(500).json({ error: err.message || "failed to add scan path" });
   }
@@ -1661,9 +2467,9 @@ app.delete("/api/scan-paths", async (req, res) => {
     }
 
     deleteScanPathStmt.run(resolved);
-    await triggerRescan("remove-scan-path");
+    const rescan = startRescan("remove-scan-path");
 
-    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths() });
+    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths(), rescan });
   } catch (err) {
     res.status(500).json({ error: err.message || "failed to remove scan path" });
   }
@@ -1680,9 +2486,9 @@ app.post("/api/exclude-paths", async (req, res) => {
     const resolved = path.resolve(raw);
     const now = new Date().toISOString();
     insertExcludePathStmt.run(resolved, now, now);
-    await triggerRescan("add-exclude-path");
+    const rescan = startRescan("add-exclude-path");
 
-    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths() });
+    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths(), rescan });
   } catch (err) {
     res.status(500).json({ error: err.message || "failed to add exclude path" });
   }
@@ -1698,41 +2504,28 @@ app.delete("/api/exclude-paths", async (req, res) => {
 
     const resolved = path.resolve(raw);
     deleteExcludePathStmt.run(resolved);
-    await triggerRescan("remove-exclude-path");
+    const rescan = startRescan("remove-exclude-path");
 
-    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths() });
+    res.json({ scanPaths: getScanPaths(), excludePaths: getExcludePaths(), rescan });
   } catch (err) {
     res.status(500).json({ error: err.message || "failed to remove exclude path" });
   }
 });
 
 app.post("/api/rescan", (_req, res) => {
-  triggerRescan("api-rescan").catch(() => {
-    // ignore
-  });
-  res.json({ ok: true, indexing: true });
+  const rescan = startRescan("api-rescan");
+  res.json({ ok: true, indexing: rescan.indexing, pending: rescan.pending, rescan });
 });
 
 app.get("/api/library", (_req, res) => {
   res.json({
-    ...librarySnapshot,
+    ...getLibraryResponse(),
     options: runtimeOptions,
-    index: {
-      isIndexing: indexState.isIndexing,
-      startedAt: indexState.startedAt,
-      finishedAt: indexState.finishedAt,
-      lastError: indexState.lastError,
-      generation: indexState.generation,
-    },
-    preview: {
-      active: previewState.active,
-      queued: previewState.queued,
-      totalQueuedThisRound: previewState.totalQueuedThisRound,
-      finishedThisRound: previewState.finishedThisRound,
-      threads: PREVIEW_THREADS,
-      ffmpegEnabled: supportsFfmpeg,
-    },
   });
+});
+
+app.get("/api/status", (_req, res) => {
+  res.json(getStatusResponse());
 });
 
 app.get("/api/folder-items", (req, res) => {
@@ -1796,6 +2589,77 @@ app.get("/api/item", (req, res) => {
   }
 });
 
+app.get("/api/archive-preview", async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const id = String(req.query.id || "").trim();
+    if (!id) {
+      res.status(400).json({ error: "id is required" });
+      return;
+    }
+
+    const item = getItemById(id);
+    if (!item || item.category !== "archive") {
+      res.status(404).json({ error: "archive not found" });
+      return;
+    }
+    if (!fs.existsSync(item.sourcePath)) {
+      res.status(404).json({ error: "archive not found" });
+      return;
+    }
+
+    const preview = await getArchivePreview(item);
+    res.json(preview);
+  } catch (err) {
+    res.status(500).json({ error: err.message || "failed to preview archive" });
+  }
+});
+
+app.get("/api/archive-media", async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const resolved = await getArchiveEntryForRequest(req, res);
+    if (!resolved) return;
+    streamArchiveEntry(resolved.archiveItem, resolved.entry, res, { download: req.query.download === "1" });
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message || "failed to stream archive entry" });
+  }
+});
+
+app.get("/api/archive-entry-preview", async (req, res) => {
+  try {
+    const resolved = await getArchiveEntryForRequest(req, res);
+    if (!resolved) return;
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(fallbackPreviewSvg(resolved.item));
+  } catch (err) {
+    res.status(500).json({ error: err.message || "failed to preview archive entry" });
+  }
+});
+
+app.get("/api/archive-video-frame", async (req, res) => {
+  try {
+    const resolved = await getArchiveEntryForRequest(req, res);
+    if (!resolved) return;
+    if (!supportsFfmpeg) {
+      res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.send(fallbackPreviewSvg(resolved.item));
+      return;
+    }
+
+    const frame = await generateArchiveVideoFrame(resolved.archiveItem, resolved.entry, resolved.item);
+    res.type("image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(frame);
+  } catch {
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(fallbackPreviewSvg({ name: "archive video", extension: ".mp4", category: "video" }));
+  }
+});
+
 app.get("/api/preview", async (req, res) => {
   const id = String(req.query.id || "");
   const item = getItemById(id);
@@ -1805,21 +2669,27 @@ app.get("/api/preview", async (req, res) => {
   }
 
   const cacheEntry = resolveCachedPreview(item);
-  const canUpgradeSvg =
+  const canUpgradeMediaSvg =
     cacheEntry &&
     cacheEntry.mimeType === "image/svg+xml" &&
     (item.category === "video" || item.category === "image") &&
     supportsFfmpeg &&
     fs.existsSync(item.sourcePath);
+  const canUpgradeArchiveSvg =
+    cacheEntry &&
+    cacheEntry.mimeType === "image/svg+xml" &&
+    item.category === "archive" &&
+    fs.existsSync(item.sourcePath);
 
-  if (cacheEntry && !canUpgradeSvg) {
+  if (cacheEntry && !canUpgradeMediaSvg) {
+    if (canUpgradeArchiveSvg) queueArchiveCoverUpgrade(item);
     res.type(cacheEntry.mimeType || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
     fs.createReadStream(cacheEntry.outputPath).pipe(res);
     return;
   }
 
-  if (canUpgradeSvg || item.category === "video" || item.category === "image") {
+  if (canUpgradeMediaSvg || item.category === "video" || item.category === "image") {
     const generated = await generatePreviewNow(item);
     if (generated && fs.existsSync(generated.outputPath)) {
       res.type(generated.mimeType || "image/jpeg");
@@ -1841,8 +2711,22 @@ app.get("/api/preview", async (req, res) => {
     }
   }
 
+  if (item.category === "archive") {
+    const fallbackArchivePreview = ensureFallbackPreviewCached(item);
+    if (fallbackArchivePreview && fs.existsSync(fallbackArchivePreview.outputPath)) {
+      queueArchiveCoverUpgrade(item);
+      res.type(fallbackArchivePreview.mimeType || "image/svg+xml");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      fs.createReadStream(fallbackArchivePreview.outputPath).pipe(res);
+      return;
+    }
+  }
+
   const shouldQueuePreview =
-    !runtimeOptions.preferMediaFolderPreview || item.category === "video" || item.category === "image";
+    !runtimeOptions.preferMediaFolderPreview ||
+    item.category === "video" ||
+    item.category === "image" ||
+    item.category === "archive";
   if (shouldQueuePreview) {
     enqueuePreviewJob(item);
   }

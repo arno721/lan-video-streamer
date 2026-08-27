@@ -8,7 +8,7 @@
   </head>
   <body class="desktop viewer-page" data-view-mode="list" data-grid-size="m">
     <main class="viewer-shell">
-      <section class="topbar panel">
+      <section class="topbar panel app-toolbar">
         <div class="title-row">
           <h1>LAN Media Hub</h1>
           <div class="actions">
@@ -22,7 +22,7 @@
             <a class="btn-secondary" href="/admin.html">管理端</a>
           </div>
         </div>
-        <p id="status-text" class="muted">載入中...</p>
+        <p id="status-text" class="muted status-strip">載入中...</p>
       </section>
 
       <section id="browse-panel" class="panel">
@@ -55,6 +55,7 @@
             <label><input type="checkbox" value="other" checked />其他</label>
           </div>
           <div class="type-actions">
+            <button id="playable-folders-toggle" type="button" class="btn-secondary">可播放資料夾: 只顯示</button>
             <button id="types-all" type="button" class="btn-secondary">全選</button>
             <button id="types-none" type="button" class="btn-secondary">全不選</button>
           </div>
@@ -102,9 +103,21 @@
         <h2 id="viewer-title" class="overlay-title">請選擇檔案</h2>
 
         <div class="overlay-media-wrap">
-          <video id="video-viewer" controls playsinline preload="metadata" class="hidden"></video>
+          <video id="video-viewer" controls playsinline preload="auto" class="hidden"></video>
           <audio id="audio-viewer" controls class="hidden"></audio>
           <img id="image-viewer" class="hidden image-viewer" alt="preview" />
+          <div id="archive-viewer" class="archive-viewer hidden"></div>
+          <div class="video-settings">
+            <button id="video-more-toggle" type="button" class="btn-secondary" aria-haspopup="menu" aria-expanded="false">
+              更多
+            </button>
+            <div id="video-more-menu" class="video-more-menu hidden" role="menu" aria-label="影片更多選項">
+              <div class="video-more-title">播放結束</div>
+              <button type="button" role="menuitemradio" data-video-end-action="stop">停止</button>
+              <button type="button" role="menuitemradio" data-video-end-action="next">自動下一部</button>
+              <button type="button" role="menuitemradio" data-video-end-action="loop">循環目前影片</button>
+            </div>
+          </div>
         </div>
 
         <div id="video-scrub-wrap" class="video-scrub-wrap hidden">

@@ -2,6 +2,7 @@
 const STATE_KEY = 'viewer_state_v6';
 const FAVORITES_KEY = 'viewer_favorites_v1';
 const TYPES = ['video', 'image', 'audio', 'document', 'archive', 'code', 'other'];
+const PLAYABLE_TYPES = new Set(['video', 'image', 'audio', 'archive']);
 
 const E = {
   refresh: document.getElementById('refresh'),
@@ -18,6 +19,7 @@ const E = {
   thumbToggle: document.getElementById('folder-thumb-toggle'),
   pathToggle: document.getElementById('path-toggle'),
   detailToggle: document.getElementById('detail-toggle'),
+  playableFoldersToggle: document.getElementById('playable-folders-toggle'),
   search: document.getElementById('search-input'),
   sort: document.getElementById('sort-select'),
   gridSize: document.getElementById('grid-size-select'),
@@ -41,9 +43,23 @@ const E = {
   video: document.getElementById('video-viewer'),
   audio: document.getElementById('audio-viewer'),
   image: document.getElementById('image-viewer'),
+  archive: document.getElementById('archive-viewer'),
   strip: document.getElementById('folder-strip'),
   scrubWrap: document.getElementById('video-scrub-wrap'),
   scrub: document.getElementById('video-scrub'),
+  videoCurrentTime: document.getElementById('video-current-time'),
+  videoDuration: document.getElementById('video-duration'),
+  videoPlay: document.getElementById('video-play-toggle'),
+  videoSkipBack: document.getElementById('video-skip-back'),
+  videoSkipForward: document.getElementById('video-skip-forward'),
+  videoMute: document.getElementById('video-mute-toggle'),
+  videoVolume: document.getElementById('video-volume'),
+  videoSpeed: document.getElementById('video-speed'),
+  videoMoreToggle: document.getElementById('video-more-toggle'),
+  videoMoreMenu: document.getElementById('video-more-menu'),
+  videoFit: document.getElementById('video-fit-toggle'),
+  videoPip: document.getElementById('video-pip-toggle'),
+  videoFullscreen: document.getElementById('video-fullscreen-toggle'),
   top: document.getElementById('scroll-top'),
   back: document.getElementById('scroll-last'),
   menu: document.getElementById('folder-menu'),
@@ -56,9 +72,12 @@ const DEFAULTS = {
   showFolderThumbs: true,
   showPaths: true,
   showDetails: true,
+  hideUnplayableFolders: true,
   showViewerTitle: true,
   showStrip: false,
   showFavorites: false,
+  videoFitMode: 'contain',
+  videoEndAction: 'stop',
   types: [...TYPES],
   sort: 'time_desc',
   search: '',
@@ -75,9 +94,12 @@ const state = {
   showFolderThumbs: DEFAULTS.showFolderThumbs,
   showPaths: DEFAULTS.showPaths,
   showDetails: DEFAULTS.showDetails,
+  hideUnplayableFolders: DEFAULTS.hideUnplayableFolders,
   showViewerTitle: DEFAULTS.showViewerTitle,
   showStrip: DEFAULTS.showStrip,
   showFavorites: DEFAULTS.showFavorites,
+  videoFitMode: DEFAULTS.videoFitMode,
+  videoEndAction: DEFAULTS.videoEndAction,
   types: new Set(DEFAULTS.types),
   sort: DEFAULTS.sort,
   search: DEFAULTS.search,
@@ -118,6 +140,8 @@ let videoTouchHoldActive = false;
 let videoTouchStartX = 0;
 let videoTouchStartY = 0;
 let videoKeyHoldTimer = null;
+let videoClickToggleTimer = null;
+let videoSuppressClickUntil = 0;
 let videoKeyHoldActive = false;
 let videoRightKeyDown = false;
 let videoRightKeyDownAt = 0;
@@ -132,6 +156,7 @@ let videoPointerStartX = 0;
 let videoPointerStartY = 0;
 let videoSpaceKeyDown = false;
 let videoBaseRate = 1;
+let videoScrubActive = false;
 let videoFallbackTimer = null;
 let videoDecodeGuardTimer = null;
 let mediaActionIndicator = null;
@@ -156,6 +181,8 @@ let overlaySwipeTracking = false;
 let overlaySwipeLastTriggerAt = 0;
 let overlayScrollLockY = 0;
 let overlayScrollLocked = false;
+let imageWheelNavDelta = 0;
+let imageWheelNavLockUntil = 0;
 let lastUserScrollAt = 0;
 let viewerNavFolder = '';
 let viewerNavItems = [];
@@ -166,7 +193,12 @@ let imagePreloadQueue = [];
 let imagePreloadQueued = new Set();
 let imagePreloadWorkers = 0;
 let treeHeightRaf = 0;
+let archivePreviewToken = 0;
+let folderRenderToken = 0;
+let archivePreviewItems = [];
 const NATIVE_VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.webm']);
+const FOLDER_RENDER_INITIAL_BATCH = 24;
+const FOLDER_RENDER_BATCH_SIZE = 48;
 
 const esc = (s) =>
   String(s || '')
@@ -187,8 +219,16 @@ const fsize = (b) => {
   return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
 };
 
-const purl = (i) => `/api/preview?id=${encodeURIComponent(i.id || i)}&k=${encodeURIComponent(i.previewKey || '')}`;
-const mediaPreviewTypeSet = () => state.types.has('video') || state.types.has('image');
+function normalizeVideoEndAction(value) {
+  return ['stop', 'next', 'loop'].includes(value) ? value : DEFAULTS.videoEndAction;
+}
+
+const purl = (i) => {
+  if (i && typeof i === 'object' && i.previewUrl) return i.previewUrl;
+  return `/api/preview?id=${encodeURIComponent(i.id || i)}&k=${encodeURIComponent(i.previewKey || '')}`;
+};
+const hasImagePreview = (item) => item?.category === 'video' || item?.category === 'image' || item?.category === 'archive';
+const mediaPreviewTypeSet = () => state.types.has('video') || state.types.has('image') || state.types.has('archive');
 const IS_MOBILE_CLIENT = document.body.classList.contains('mobile');
 const IMAGE_PRELOAD_LOOKAHEAD = IS_MOBILE_CLIENT ? 12 : 8;
 const IMAGE_PRELOAD_CACHE_LIMIT = IS_MOBILE_CLIENT ? 36 : 24;
@@ -209,6 +249,7 @@ const getVideoTranscodeUrl = (item) =>
   item?.transcodeUrl || `/media-transcode?id=${encodeURIComponent(item?.id || '')}`;
 const getVideoTranscodeFileUrl = (item) =>
   item?.transcodeFileUrl || `/media-transcode-file?id=${encodeURIComponent(item?.id || '')}`;
+const isTranscodeFileSource = (url) => String(url || '').includes('/media-transcode-file');
 const isDirectVideoPreferred = (item) => {
   if (typeof item?.directPlayPreferred === 'boolean') return item.directPlayPreferred;
   return NATIVE_VIDEO_EXTENSIONS.has(String(item?.extension || '').toLowerCase());
@@ -255,9 +296,9 @@ function playVideoWithFallback(item) {
 
   if (preferTranscodePlayback) {
     if (directPreferred) {
-      order.push(transcodeUrl, directUrl, transcodeFileUrl);
+      order.push(directUrl, transcodeUrl, transcodeFileUrl);
     } else {
-      order.push(transcodeUrl, transcodeFileUrl, directUrl);
+      order.push(transcodeUrl, directUrl, transcodeFileUrl);
     }
   } else if (IS_MOBILE_CLIENT) {
     if (mobileTranscodeFirst) {
@@ -270,13 +311,13 @@ function playVideoWithFallback(item) {
       if (directPreferred) {
         order.push(directUrl, transcodeFileUrl, transcodeUrl);
       } else {
-        order.push(transcodeFileUrl, directUrl, transcodeUrl);
+        order.push(transcodeUrl, directUrl, transcodeFileUrl);
       }
     }
   } else if (directPreferred) {
     order.push(directUrl, transcodeUrl, transcodeFileUrl);
   } else {
-    order.push(transcodeUrl, transcodeFileUrl, directUrl);
+    order.push(transcodeUrl, directUrl, transcodeFileUrl);
   }
 
   const unique = [];
@@ -293,8 +334,10 @@ function playVideoWithFallback(item) {
 
   E.video.dataset.fallbackQueue = JSON.stringify(queue);
   E.video.dataset.fallbackUsed = '0';
+  E.video.removeAttribute('data-pending-seek');
   videoHasStartedPlaying = false;
   setVideoLoadIndicator('正在載入...');
+  syncVideoControls();
   clearVideoFallbackTimer();
   clearVideoDecodeGuardTimer();
   E.video.src = primary;
@@ -366,6 +409,8 @@ function armVideoDecodeGuard() {
 
 function armVideoFallbackTimer() {
   clearVideoFallbackTimer();
+  const source = String(E.video.currentSrc || E.video.src || '');
+  if (isTranscodeFileSource(source)) return;
   videoFallbackTimer = setTimeout(() => {
     if (E.video.classList.contains('hidden')) return;
     if (Number(E.video.readyState || 0) >= 2) return;
@@ -384,8 +429,12 @@ function tryNextVideoFallback() {
   const next = String(queue.shift() || '').trim();
   E.video.dataset.fallbackQueue = JSON.stringify(queue);
   if (!next) return false;
+  const resumeTime = Number(E.video.currentTime || 0);
+  if (Number.isFinite(resumeTime) && resumeTime > 0) E.video.dataset.pendingSeek = String(resumeTime);
+  else E.video.removeAttribute('data-pending-seek');
   E.video.dataset.fallbackUsed = '1';
-  setVideoLoadIndicator('正在切換更快串流...');
+  setVideoLoadIndicator('正在切換相容來源...');
+  syncVideoControls();
   clearVideoFallbackTimer();
   clearVideoDecodeGuardTimer();
   E.video.src = next;
@@ -405,9 +454,12 @@ function loadState() {
     if (typeof v.showFolderThumbs === 'boolean') state.showFolderThumbs = v.showFolderThumbs;
     if (typeof v.showPaths === 'boolean') state.showPaths = v.showPaths;
     if (typeof v.showDetails === 'boolean') state.showDetails = v.showDetails;
+    if (typeof v.hideUnplayableFolders === 'boolean') state.hideUnplayableFolders = v.hideUnplayableFolders;
     if (typeof v.showViewerTitle === 'boolean') state.showViewerTitle = v.showViewerTitle;
     if (typeof v.showStrip === 'boolean') state.showStrip = v.showStrip;
     if (typeof v.showFavorites === 'boolean') state.showFavorites = v.showFavorites;
+    if (v.videoFitMode === 'contain' || v.videoFitMode === 'cover') state.videoFitMode = v.videoFitMode;
+    state.videoEndAction = normalizeVideoEndAction(v.videoEndAction);
     if (Array.isArray(v.types)) state.types = new Set(v.types.filter((x) => TYPES.includes(x)));
     if (typeof v.sort === 'string') state.sort = v.sort;
     if (typeof v.search === 'string') state.search = v.search;
@@ -429,9 +481,12 @@ function saveState() {
       showFolderThumbs: state.showFolderThumbs,
       showPaths: state.showPaths,
       showDetails: state.showDetails,
+      hideUnplayableFolders: state.hideUnplayableFolders,
       showViewerTitle: state.showViewerTitle,
       showStrip: state.showStrip,
       showFavorites: state.showFavorites,
+      videoFitMode: state.videoFitMode,
+      videoEndAction: state.videoEndAction,
       types: [...state.types],
       sort: state.sort,
       search: state.search,
@@ -557,6 +612,7 @@ function startVideoFastForward() {
   videoFastForwardByHold = true;
   const speedText = Number(E.video.playbackRate || viewerOptions.videoHoldSpeed).toFixed(2).replace(/\.?0+$/, '');
   showMediaActionIndicator(`${speedText}x`, { sticky: true });
+  syncVideoControls();
 }
 
 function stopVideoFastForward() {
@@ -565,6 +621,7 @@ function stopVideoFastForward() {
   videoFastForwardByHold = false;
   videoKeyHoldActive = false;
   hideMediaActionIndicator(true);
+  syncVideoControls();
 }
 
 function ensureMediaActionIndicator() {
@@ -659,11 +716,307 @@ function updateVideoLoadIndicator() {
   setVideoLoadIndicator('正在載入...');
 }
 
+function formatVideoTime(value) {
+  const total = Math.max(0, Math.floor(Number(value || 0)));
+  if (!Number.isFinite(total)) return '0:00';
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function getVideoDuration() {
+  const d = Number(E.video?.duration || 0);
+  return Number.isFinite(d) && d > 0 ? d : 0;
+}
+
+function setRangeProgress(el, value, max) {
+  if (!el) return;
+  const pct = max > 0 ? Math.max(0, Math.min(100, (Number(value || 0) / max) * 100)) : 0;
+  el.style.setProperty('--range-progress', `${pct}%`);
+}
+
+function syncVideoScrub() {
+  if (!E.video || !E.scrub) return;
+  const d = getVideoDuration();
+  const t = Number(E.video.currentTime || 0);
+  E.scrub.max = String(d || 0);
+  if (!videoScrubActive) E.scrub.value = String(Math.max(0, Math.min(d || t, t)));
+  if (E.videoCurrentTime) E.videoCurrentTime.textContent = formatVideoTime(t);
+  if (E.videoDuration) E.videoDuration.textContent = d > 0 ? formatVideoTime(d) : '0:00';
+  setRangeProgress(E.scrub, Number(E.scrub.value || t), d);
+}
+
+function syncVideoEndActionMenu() {
+  if (!E.videoMoreMenu) return;
+  for (const button of E.videoMoreMenu.querySelectorAll('[data-video-end-action]')) {
+    const selected = button.dataset.videoEndAction === state.videoEndAction;
+    button.classList.toggle('is-selected', selected);
+    button.setAttribute('aria-checked', selected ? 'true' : 'false');
+  }
+}
+
+function applyVideoFitMode() {
+  const cover = state.videoFitMode === 'cover';
+  const isVideoVisible = !!(E.video && !E.video.classList.contains('hidden'));
+  E.mediaWrap?.classList.toggle('video-fill', cover && isVideoVisible);
+  if (E.videoFit) E.videoFit.textContent = cover ? '完整' : '填滿';
+}
+
+function syncVideoControls() {
+  if (!E.video) return;
+  const isVideoVisible = !E.video.classList.contains('hidden');
+  E.scrubWrap?.classList.toggle('hidden', !isVideoVisible);
+
+  if (E.videoPlay) E.videoPlay.textContent = E.video.paused || E.video.ended ? '播放' : '暫停';
+  if (E.videoMute) E.videoMute.textContent = E.video.muted || Number(E.video.volume || 0) === 0 ? '取消靜音' : '靜音';
+  if (E.videoVolume) {
+    E.videoVolume.value = String(E.video.muted ? 0 : Number(E.video.volume || 0));
+    setRangeProgress(E.videoVolume, Number(E.videoVolume.value || 0), 1);
+  }
+  if (E.videoSpeed) {
+    const rate = String(Number(E.video.playbackRate || 1));
+    if ([...E.videoSpeed.options].some((x) => x.value === rate)) E.videoSpeed.value = rate;
+  }
+  syncVideoEndActionMenu();
+  if (E.videoSkipBack) E.videoSkipBack.textContent = `退 ${viewerOptions.videoSeekSeconds}s`;
+  if (E.videoSkipForward) E.videoSkipForward.textContent = `進 ${viewerOptions.videoSeekSeconds}s`;
+
+  const pipSupported = !!(document.pictureInPictureEnabled && E.video && !E.video.disablePictureInPicture);
+  if (E.videoPip) {
+    E.videoPip.disabled = !pipSupported;
+    E.videoPip.textContent = document.pictureInPictureElement === E.video ? '退出小窗' : '小窗';
+  }
+  if (E.videoFullscreen) {
+    const fullscreenEl = document.fullscreenElement;
+    E.videoFullscreen.textContent = fullscreenEl ? '退出全螢幕' : '全螢幕';
+  }
+  applyVideoFitMode();
+  syncVideoScrub();
+}
+
+function setOverlayMediaMode(category) {
+  const panel = E.overlay?.querySelector('.overlay-panel');
+  if (!panel) return;
+  panel.classList.toggle('is-video-viewer', category === 'video');
+  panel.classList.toggle('is-audio-viewer', category === 'audio');
+  panel.classList.toggle('is-image-viewer', category === 'image');
+  panel.classList.toggle('is-archive-viewer', category === 'archive');
+}
+
+function toggleVideoPlayback() {
+  if (!isOverlayVideoActive()) return;
+  const shouldPlay = E.video.paused || E.video.ended;
+  if (shouldPlay) E.video.play().catch(() => {});
+  else E.video.pause();
+  showMediaActionIndicator(shouldPlay ? '播放' : '暫停', { duration: 360 });
+  syncVideoControls();
+}
+
+function setVideoVolume(value) {
+  const n = Math.max(0, Math.min(1, Number(value)));
+  if (!Number.isFinite(n)) return;
+  E.video.volume = n;
+  E.video.muted = n <= 0;
+  syncVideoControls();
+}
+
+function toggleVideoMute() {
+  E.video.muted = !E.video.muted;
+  if (!E.video.muted && Number(E.video.volume || 0) === 0) E.video.volume = 0.7;
+  showMediaActionIndicator(E.video.muted ? '靜音' : '取消靜音', { duration: 420 });
+  syncVideoControls();
+}
+
+function setVideoRate(rate) {
+  const n = Math.max(0.25, Math.min(4, Number(rate || 1)));
+  if (!Number.isFinite(n)) return;
+  E.video.playbackRate = n;
+  videoBaseRate = n;
+  const speedText = n.toFixed(2).replace(/\.?0+$/, '');
+  showMediaActionIndicator(`${speedText}x`, { duration: 420 });
+  syncVideoControls();
+}
+
+function stepVideoRate(delta) {
+  const rates = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+  const current = Number(E.video.playbackRate || 1);
+  let idx = rates.findIndex((x) => x >= current - 0.001);
+  if (idx < 0) idx = rates.indexOf(1);
+  const next = rates[Math.max(0, Math.min(rates.length - 1, idx + delta))];
+  setVideoRate(next);
+}
+
+function toggleVideoFitMode() {
+  state.videoFitMode = state.videoFitMode === 'cover' ? 'contain' : 'cover';
+  applyVideoFitMode();
+  saveSoon();
+}
+
+function setVideoEndAction(value) {
+  state.videoEndAction = normalizeVideoEndAction(value);
+  syncVideoControls();
+  saveSoon();
+}
+
+function closeVideoMoreMenu() {
+  E.videoMoreMenu?.classList.add('hidden');
+  E.videoMoreToggle?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleVideoMoreMenu() {
+  if (!E.videoMoreMenu || !E.videoMoreToggle) return;
+  const willOpen = E.videoMoreMenu.classList.contains('hidden');
+  E.videoMoreMenu.classList.toggle('hidden', !willOpen);
+  E.videoMoreToggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  if (willOpen) syncVideoEndActionMenu();
+}
+
+function handleVideoEnded() {
+  syncVideoControls();
+  if (state.videoEndAction === 'loop') {
+    E.video.currentTime = 0;
+    E.video.play().catch(() => {});
+    return;
+  }
+  if (state.videoEndAction === 'next') {
+    openNextVideo()
+      .then((opened) => {
+        if (!opened) showMediaActionIndicator('沒有下一部影片', { duration: 760 });
+      })
+      .catch(() => showMediaActionIndicator('無法開啟下一部影片', { duration: 760 }));
+  }
+}
+
+async function toggleVideoPictureInPicture() {
+  if (!document.pictureInPictureEnabled || !E.video || E.video.disablePictureInPicture) return;
+  try {
+    if (document.pictureInPictureElement === E.video) await document.exitPictureInPicture();
+    else await E.video.requestPictureInPicture();
+  } catch {
+    showMediaActionIndicator('小窗不可用', { duration: 620 });
+  }
+  syncVideoControls();
+}
+
+async function toggleVideoFullscreen() {
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      const target = E.mediaWrap || E.video;
+      await target.requestFullscreen?.();
+    }
+  } catch {
+    showMediaActionIndicator('全螢幕不可用', { duration: 620 });
+  }
+  syncVideoControls();
+}
+
+function isTextEntryTarget(el) {
+  if (!el) return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select' || !!el.isContentEditable;
+}
+
+function handleVideoShortcutKeyDown(e) {
+  if (!isOverlayVideoActive()) return false;
+  if (isTextEntryTarget(document.activeElement) && document.activeElement !== E.video) return false;
+  const key = String(e.key || '').toLowerCase();
+
+  if (key === 'm') {
+    consumeKeyEvent(e);
+    toggleVideoMute();
+    return true;
+  }
+  if (key === 'f') {
+    consumeKeyEvent(e);
+    toggleVideoFullscreen();
+    return true;
+  }
+  if (key === 'p') {
+    consumeKeyEvent(e);
+    toggleVideoPictureInPicture();
+    return true;
+  }
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    consumeKeyEvent(e);
+    const delta = e.key === 'ArrowUp' ? 0.05 : -0.05;
+    setVideoVolume((E.video.muted ? 0 : Number(E.video.volume || 0)) + delta);
+    return true;
+  }
+  if (e.key === 'Home') {
+    consumeKeyEvent(e);
+    E.video.currentTime = 0;
+    syncVideoControls();
+    return true;
+  }
+  if (e.key === 'End') {
+    consumeKeyEvent(e);
+    const d = getVideoDuration();
+    if (d > 0) E.video.currentTime = d;
+    syncVideoControls();
+    return true;
+  }
+  if (key === ',' || key === '<') {
+    consumeKeyEvent(e);
+    stepVideoRate(-1);
+    return true;
+  }
+  if (key === '.' || key === '>') {
+    consumeKeyEvent(e);
+    stepVideoRate(1);
+    return true;
+  }
+  return false;
+}
+
 function clearVideoKeyHoldTimer() {
   if (videoKeyHoldTimer) {
     clearTimeout(videoKeyHoldTimer);
     videoKeyHoldTimer = null;
   }
+}
+
+function clearVideoClickToggleTimer() {
+  if (videoClickToggleTimer) {
+    clearTimeout(videoClickToggleTimer);
+    videoClickToggleTimer = null;
+  }
+}
+
+function suppressNextVideoClick(durationMs = 260) {
+  videoSuppressClickUntil = Date.now() + durationMs;
+  clearVideoClickToggleTimer();
+}
+
+function handleVideoSurfaceClick(e) {
+  if (!isOverlayVideoActive()) return;
+  if (E.video.classList.contains('hidden')) return;
+  if (IS_MOBILE_CLIENT) return;
+  if (e.button !== 0 || Date.now() < videoSuppressClickUntil) return;
+  if (e.target.closest('.video-settings')) return;
+  if (e.target.closest('button, a, input, select, textarea, [role="button"], [role="menu"]')) return;
+
+  const rect = E.video.getBoundingClientRect();
+  if (rect.width > 0 && rect.height > 0) {
+    const isInsideVideo = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    if (!isInsideVideo) return;
+    if (e.clientY >= rect.bottom - 56) return;
+  }
+
+  if (e.detail > 1) {
+    suppressNextVideoClick();
+    return;
+  }
+
+  clearVideoClickToggleTimer();
+  videoClickToggleTimer = setTimeout(() => {
+    videoClickToggleTimer = null;
+    if (Date.now() < videoSuppressClickUntil) return;
+    toggleVideoPlayback();
+  }, 220);
 }
 
 function resetVideoTapState() {
@@ -695,6 +1048,7 @@ function seekVideoRelative(deltaSec) {
   if (E.scrub && !Number.isNaN(E.video.currentTime)) {
     E.scrub.value = String(Number(E.video.currentTime || 0));
   }
+  syncVideoScrub();
   const sec = Math.abs(Math.round(Number(deltaSec || 0)));
   if (sec > 0) showMediaActionIndicator(`${deltaSec >= 0 ? '+' : '-'}${sec}s`, { duration: 560 });
 }
@@ -794,10 +1148,7 @@ function handleVideoSpaceKeyDown(e) {
     active.blur?.();
   }
 
-  const shouldPlay = !!(E.video.paused || E.video.ended);
-  if (shouldPlay) E.video.play().catch(() => {});
-  else E.video.pause();
-  showMediaActionIndicator(shouldPlay ? '播放' : '暫停', { duration: 360 });
+  toggleVideoPlayback();
   return true;
 }
 
@@ -938,6 +1289,32 @@ function toggleImageZoomByClick(ev) {
   setImageZoom(zoomTarget, { ratioX, ratioY });
 }
 
+function handleImageWheelNavigate(e) {
+  if (E.overlay.classList.contains('hidden')) return;
+  const current = currentId ? itemStore.get(currentId) : null;
+  if (!current || current.category !== 'image') return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  if (imageZoomScale > 1.01) {
+    const canScrollY = E.mediaWrap.scrollHeight > E.mediaWrap.clientHeight + 2;
+    const canScrollX = E.mediaWrap.scrollWidth > E.mediaWrap.clientWidth + 2;
+    if (canScrollY || canScrollX) return;
+  }
+
+  const majorDelta = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (!Number.isFinite(majorDelta) || Math.abs(majorDelta) < 1) return;
+
+  e.preventDefault();
+  imageWheelNavDelta += majorDelta;
+  if (Date.now() < imageWheelNavLockUntil) return;
+  if (Math.abs(imageWheelNavDelta) < 36) return;
+
+  const dir = imageWheelNavDelta > 0 ? 1 : -1;
+  imageWheelNavDelta = 0;
+  imageWheelNavLockUntil = Date.now() + 180;
+  openAdj(dir).catch(() => {});
+}
+
 function resetImagePointerState() {
   imagePointerId = -1;
   imagePointerMoved = false;
@@ -973,6 +1350,7 @@ function bindVideoFastForwardHold() {
   E.video.addEventListener('dblclick', (e) => {
     if (E.video.classList.contains('hidden')) return;
     e.preventDefault();
+    suppressNextVideoClick();
     const side = getVideoTapSide(e.clientX);
     seekVideoBySide(side);
   });
@@ -1043,7 +1421,10 @@ function bindVideoFastForwardHold() {
     clearVideoPointerHoldTimer();
     videoPointerHoldActive = false;
     videoPointerHoldId = -1;
-    if (wasActive) stopVideoFastForward();
+    if (wasActive) {
+      suppressNextVideoClick();
+      stopVideoFastForward();
+    }
   };
   E.video.addEventListener('pointerup', endPointerHold, { passive: true });
   E.video.addEventListener('pointercancel', endPointerHold, { passive: true });
@@ -1097,6 +1478,7 @@ function bindVideoFastForwardHold() {
       stopVideoFastForward();
     }
     if (wasHold) {
+      suppressNextVideoClick();
       resetVideoTapState();
       return;
     }
@@ -1108,6 +1490,7 @@ function bindVideoFastForwardHold() {
     const side = getVideoTapSide(t.clientX);
     const nowMs = Date.now();
     if (videoLastTapSide === side && nowMs - videoLastTapAt <= 300) {
+      suppressNextVideoClick();
       seekVideoBySide(side);
       resetVideoTapState();
       return;
@@ -1159,6 +1542,7 @@ function syncControlStates() {
   setBinaryButtonState(E.thumbToggle, state.showFolderThumbs);
   setBinaryButtonState(E.pathToggle, state.showPaths);
   setBinaryButtonState(E.detailToggle, state.showDetails);
+  setBinaryButtonState(E.playableFoldersToggle, state.hideUnplayableFolders);
   setBinaryButtonState(E.viewerNameToggle, state.showViewerTitle);
   setBinaryButtonState(E.toggleStrip, state.showStrip);
   setBinaryButtonState(E.favoritesToggle, state.showFavorites);
@@ -1173,6 +1557,9 @@ function syncUI() {
   E.thumbToggle.textContent = state.showFolderThumbs ? '資料夾縮圖: 開' : '資料夾縮圖: 關';
   E.pathToggle.textContent = state.showPaths ? '路徑: 開' : '路徑: 關';
   E.detailToggle.textContent = state.showDetails ? '詳細: 開' : '詳細: 關';
+  if (E.playableFoldersToggle) {
+    E.playableFoldersToggle.textContent = state.hideUnplayableFolders ? '可播放資料夾: 只顯示' : '可播放資料夾: 全部';
+  }
   E.viewerNameToggle.textContent = state.showViewerTitle ? '檔名: 開' : '檔名: 關';
   document.body.classList.toggle('hide-paths', !state.showPaths);
   document.body.classList.toggle('hide-details', !state.showDetails);
@@ -1195,11 +1582,21 @@ function typeCount(c) {
   return s;
 }
 
+function playableTypeCount(c) {
+  if (!c || state.types.size === 0) return 0;
+  let s = 0;
+  for (const t of state.types) {
+    if (PLAYABLE_TYPES.has(t)) s += Number(c[t] || 0);
+  }
+  return s;
+}
+
 function mediaCount(c) {
   if (!c) return 0;
   let s = 0;
   if (state.types.has('video')) s += Number(c.video || 0);
   if (state.types.has('image')) s += Number(c.image || 0);
+  if (state.types.has('archive')) s += Number(c.archive || 0);
   return s;
 }
 
@@ -1208,10 +1605,19 @@ function filt(node, k) {
   const match = !k || `${node.name || ''} ${node.path || ''}`.toLowerCase().includes(k);
   const cnt = typeCount(node.counts);
   const mcnt = mediaCount(node.counts);
+  const playableCnt = playableTypeCount(node.counts);
   const kidsCnt = kids.reduce((s, x) => s + Number(x.filteredCount || 0), 0);
   const ownCnt = Math.max(0, cnt - kidsCnt);
+  if (node.path !== '/' && state.hideUnplayableFolders && playableCnt <= 0) return null;
   if (node.path !== '/' && !match && !kids.length) return null;
-  return { ...node, children: kids, filteredCount: cnt, filteredMediaCount: mcnt, filteredOwnCount: ownCnt };
+  return {
+    ...node,
+    children: kids,
+    filteredCount: cnt,
+    filteredMediaCount: mcnt,
+    filteredPlayableCount: playableCnt,
+    filteredOwnCount: ownCnt,
+  };
 }
 
 function allPaths(node, a = []) {
@@ -1234,6 +1640,64 @@ function ancestors(pathText) {
   return out;
 }
 
+function applyStatusPayload(payload) {
+  if (!payload) return;
+  const p = payload.preview || {};
+  const i = payload.index || {};
+  E.status.innerHTML = renderStatusChips([
+    ['檔案', payload.totalItems || 0],
+    ['大小', fsize(payload.totalSize || 0)],
+    ['索引', i.isIndexing ? '索引中' : '完成', i.isIndexing ? 'active' : 'ok'],
+    ['預覽', `${p.finishedThisRound || 0}/${p.totalQueuedThisRound || 0}`],
+  ]);
+}
+
+function renderStatusChips(items) {
+  return items
+    .map(([label, value, tone]) => {
+      const toneClass = tone ? ` status-chip-${esc(tone)}` : '';
+      return `<span class="status-chip${toneClass}"><span class="status-label">${esc(label)}</span><span class="status-value">${esc(value)}</span></span>`;
+    })
+    .join('');
+}
+
+function needsStatusPolling(payload) {
+  const p = payload?.preview || {};
+  const i = payload?.index || {};
+  return !!(i.isIndexing || i.pendingRescan || Number(p.queued || 0) > 0 || Number(p.active || 0) > 0);
+}
+
+function updateStatusPolling(payload) {
+  const needPoll = needsStatusPolling(payload);
+  if (needPoll && !pollTimer) pollTimer = setInterval(() => pollStatus().catch(() => {}), 2500);
+  if (!needPoll && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+async function pollStatus() {
+  const r = await fetch('/api/status', { cache: 'no-store' });
+  if (!r.ok) throw new Error(`讀取狀態失敗 (${r.status})`);
+  const status = await r.json();
+
+  if (!lib || status.generation !== lib.generation) {
+    await loadLib(true);
+    return;
+  }
+
+  lib = {
+    ...lib,
+    totalItems: status.totalItems,
+    totalSize: status.totalSize,
+    generatedAt: status.generatedAt,
+    index: status.index,
+    preview: status.preview,
+  };
+  applyStatusPayload(lib);
+  updateStatusPolling(status);
+}
+
 async function loadLib(silent = false) {
   if (isLoading) return;
   isLoading = true;
@@ -1247,15 +1711,8 @@ async function loadLib(silent = false) {
     folderAllCache = new Map();
     itemStore = new Map();
     folderByItem = new Map();
-    const p = lib.preview || {};
-    const i = lib.index || {};
-    E.status.textContent = [`檔案 ${lib.totalItems || 0}`, `大小 ${fsize(lib.totalSize || 0)}`, i.isIndexing ? '索引中' : '索引完成', `預覽 ${p.finishedThisRound || 0}/${p.totalQueuedThisRound || 0}`].join(' | ');
-    const needPoll = !!(i.isIndexing || Number(p.queued || 0) > 0 || Number(p.active || 0) > 0);
-    if (needPoll && !pollTimer) pollTimer = setInterval(() => loadLib(true).catch(() => {}), 2500);
-    if (!needPoll && pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    applyStatusPayload(lib);
+    updateStatusPolling(lib);
     await render();
     renderFavorites();
   } catch (err) {
@@ -1300,55 +1757,185 @@ function createGenericThumb(item) {
   return box;
 }
 
+function archivePreviewUrl(item) {
+  return `/api/archive-preview?id=${encodeURIComponent(item?.id || '')}`;
+}
+
+function renderArchivePreviewLoading(item) {
+  if (!E.archive) return;
+  E.archive.innerHTML = `
+    <div class="archive-preview-head">
+      <div>
+        <div class="archive-preview-title">${esc(item.name)}</div>
+        <div class="archive-preview-meta">ARCHIVE | ${fsize(item.size)}</div>
+      </div>
+    </div>
+    <div class="archive-preview-state">正在讀取壓縮包內容...</div>
+  `;
+}
+
+function renderArchivePreviewError(item, message) {
+  if (!E.archive) return;
+  E.archive.innerHTML = `
+    <div class="archive-preview-head">
+      <div>
+        <div class="archive-preview-title">${esc(item.name)}</div>
+        <div class="archive-preview-meta">ARCHIVE | ${fsize(item.size)}</div>
+      </div>
+    </div>
+    <div class="archive-preview-state archive-preview-error">${esc(message || '壓縮包預覽失敗')}</div>
+  `;
+}
+
+function renderArchivePreviewData(data) {
+  if (!E.archive) return;
+  const item = data.item || {};
+  const summary = data.summary || {};
+  const items = Array.isArray(data.items) ? data.items : [];
+  archivePreviewItems = items;
+  for (const entryItem of items) {
+    if (!entryItem?.id) continue;
+    itemStore.set(entryItem.id, entryItem);
+    folderByItem.set(entryItem.id, `archive:${item.id || ''}`);
+  }
+
+  E.archive.innerHTML = `
+    <div class="archive-preview-head">
+      <div>
+        <div class="archive-preview-title">${esc(item.name || 'archive')}</div>
+        <div class="archive-preview-meta">
+          ${Number(summary.files || 0)} 個檔案 | ${Number(summary.directories || 0)} 個資料夾 | ${fsize(summary.totalSize || 0)}
+          ${data.truncated ? ' | 已截斷' : ''}
+        </div>
+      </div>
+    </div>
+    <div class="archive-entry-list"></div>
+  `;
+
+  const list = E.archive.querySelector('.archive-entry-list');
+  if (!items.length) {
+    list.innerHTML = '<div class="archive-preview-state">壓縮包內沒有可顯示的項目</div>';
+    return;
+  }
+  list.append(itemList(items));
+}
+
+async function loadArchivePreview(item) {
+  if (!E.archive) return;
+  const token = ++archivePreviewToken;
+  E.archive.classList.remove('hidden');
+  renderArchivePreviewLoading(item);
+
+  try {
+    const res = await fetch(archivePreviewUrl(item));
+    const data = await res.json().catch(() => ({}));
+    if (token !== archivePreviewToken) return;
+    if (!res.ok) throw new Error(data.error || `壓縮包預覽失敗 (${res.status})`);
+    renderArchivePreviewData(data);
+  } catch (err) {
+    if (token !== archivePreviewToken) return;
+    renderArchivePreviewError(item, err.message || '壓縮包預覽失敗');
+  }
+}
+
 function makeFavoriteItemButton(itemId) {
   const isFav = favorites.items.has(itemId);
   return `<button type="button" class="btn-secondary" data-action="toggle-fav-item" data-id="${esc(itemId)}">${isFav ? '★已收藏' : '☆收藏'}</button>`;
 }
 
-function itemList(items) {
-  const ul = document.createElement('ul');
-  ul.className = state.viewMode === 'grid' ? 'media-list grid-mode' : 'media-list list-mode';
+function createMediaListElement() {
+  const list = document.createElement('ul');
+  list.className = state.viewMode === 'grid' ? 'media-list grid-mode' : 'media-list list-mode';
+  return list;
+}
 
-  for (const it of items) {
-    const li = document.createElement('li');
-    li.className = 'media-item';
+function createMediaItemElement(it) {
+  const li = document.createElement('li');
+  li.className = 'media-item';
 
-    const thumbWrap = document.createElement('div');
-    thumbWrap.className = 'thumb-wrap';
-    if (it.category === 'video' || it.category === 'image') {
-      const img = document.createElement('img');
-      img.className = 'thumb';
-      img.loading = 'lazy';
-      img.decoding = 'async';
-      img.alt = it.name;
-      img.dataset.action = 'open';
-      img.dataset.id = it.id;
-      img.src = purl(it);
-      thumbWrap.append(img);
-    } else {
-      const generic = createGenericThumb(it);
-      generic.dataset.action = 'open';
-      generic.dataset.id = it.id;
-      thumbWrap.append(generic);
-    }
-
-    const info = document.createElement('div');
-    info.className = 'media-info';
-    info.innerHTML = `<div class="media-title">${esc(it.name)}</div><div class="media-meta">${it.category.toUpperCase()} | ${fsize(it.size)} | ${new Date(it.updatedAt).toLocaleString()}</div><div class="media-path">${esc(it.displayPath || it.relativePath)}</div>`;
-
-    const a = document.createElement('div');
-    a.className = 'media-actions';
-    a.innerHTML = `<button type="button" data-action="open" data-id="${esc(it.id)}">查看</button>${makeFavoriteItemButton(it.id)}`;
-
-    li.append(thumbWrap, info, a);
-    ul.append(li);
+  const thumbWrap = document.createElement('div');
+  thumbWrap.className = 'thumb-wrap';
+  if (hasImagePreview(it)) {
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = it.name;
+    img.dataset.action = 'open';
+    img.dataset.id = it.id;
+    img.src = purl(it);
+    thumbWrap.append(img);
+  } else {
+    const generic = createGenericThumb(it);
+    generic.dataset.action = 'open';
+    generic.dataset.id = it.id;
+    thumbWrap.append(generic);
   }
+
+  const info = document.createElement('div');
+  info.className = 'media-info';
+  info.innerHTML = `<div class="media-title">${esc(it.name)}</div><div class="media-meta">${it.category.toUpperCase()} | ${fsize(it.size)} | ${new Date(it.updatedAt).toLocaleString()}</div><div class="media-path">${esc(it.displayPath || it.relativePath)}</div>`;
+
+  const a = document.createElement('div');
+  a.className = 'media-actions';
+  a.innerHTML = `<button type="button" data-action="open" data-id="${esc(it.id)}">查看</button>${makeFavoriteItemButton(it.id)}`;
+
+  li.append(thumbWrap, info, a);
+  return li;
+}
+
+function appendMediaItems(list, items, start, end) {
+  const frag = document.createDocumentFragment();
+  for (let i = start; i < end; i += 1) {
+    frag.append(createMediaItemElement(items[i]));
+  }
+  list.append(frag);
+}
+
+function itemList(items) {
+  const ul = createMediaListElement();
+  appendMediaItems(ul, items, 0, items.length);
   return ul;
 }
 
+function scheduleIdleWork(callback) {
+  if ('requestIdleCallback' in window) {
+    return window.requestIdleCallback(callback, { timeout: 120 });
+  }
+  return window.setTimeout(() => callback({ didTimeout: true, timeRemaining: () => 0 }), 16);
+}
+
+function renderItemsBatched(items, host, token, options = {}) {
+  const firstBatchSize = Math.max(1, Number(options.firstBatchSize) || FOLDER_RENDER_INITIAL_BATCH);
+  const batchSize = Math.max(1, Number(options.batchSize) || FOLDER_RENDER_BATCH_SIZE);
+  const list = createMediaListElement();
+  let cursor = 0;
+
+  host.append(list);
+
+  const appendNext = (count) => {
+    if (token !== folderRenderToken) return false;
+    const end = Math.min(items.length, cursor + count);
+    appendMediaItems(list, items, cursor, end);
+    cursor = end;
+    refreshOpenTreeHeightsSoon();
+    return cursor < items.length;
+  };
+
+  if (!appendNext(firstBatchSize)) return;
+
+  const appendLater = () => {
+    if (!appendNext(batchSize)) return;
+    scheduleIdleWork(appendLater);
+  };
+  scheduleIdleWork(appendLater);
+}
+
 async function mountFolder(path, host, all = false) {
+  const token = ++folderRenderToken;
   try {
     const d = await folderItems(path, all);
+    if (token !== folderRenderToken) return;
     if (!(d.items || []).length) {
       host.innerHTML = '';
       host.classList.add('is-empty');
@@ -1356,8 +1943,9 @@ async function mountFolder(path, host, all = false) {
     }
     host.classList.remove('is-empty');
     host.innerHTML = '';
-    host.append(itemList(d.items));
+    renderItemsBatched(d.items, host, token);
   } catch {
+    if (token !== folderRenderToken) return;
     host.innerHTML = '';
     host.classList.add('is-empty');
   }
@@ -1366,8 +1954,13 @@ async function mountFolder(path, host, all = false) {
 function folderPreviewId(node) {
   if (!state.showFolderThumbs) return null;
   if (!mediaPreviewTypeSet()) return null;
-  if ((node.filteredMediaCount || 0) <= 0) return null;
-  return node.sampleMediaItemId || null;
+  const previewCount = Number.isFinite(Number(node.filteredMediaCount)) ? Number(node.filteredMediaCount) : mediaCount(node.counts);
+  if (previewCount <= 0) return null;
+  if (node.sampleMediaItemId && state.types.has(node.sampleMediaCategory)) {
+    return node.sampleMediaItemId;
+  }
+  if (state.types.has('archive') && node.sampleArchiveItemId) return node.sampleArchiveItemId;
+  return null;
 }
 
 function folderRow(node) {
@@ -1566,7 +2159,7 @@ async function render() {
   }
   const ft = filt(tree, state.search.trim().toLowerCase());
   lastFilteredTree = ft;
-  if (!ft || !((ft.children && ft.children.length) || ft.path === '/')) {
+  if (!ft || !(ft.children && ft.children.length)) {
     E.empty.classList.remove('hidden');
     E.tree.innerHTML = '';
     return;
@@ -1718,9 +2311,12 @@ function resetView() {
   state.showFolderThumbs = DEFAULTS.showFolderThumbs;
   state.showPaths = DEFAULTS.showPaths;
   state.showDetails = DEFAULTS.showDetails;
+  state.hideUnplayableFolders = DEFAULTS.hideUnplayableFolders;
   state.showViewerTitle = DEFAULTS.showViewerTitle;
   state.showStrip = DEFAULTS.showStrip;
   state.showFavorites = DEFAULTS.showFavorites;
+  state.videoFitMode = DEFAULTS.videoFitMode;
+  state.videoEndAction = DEFAULTS.videoEndAction;
   state.types = new Set(DEFAULTS.types);
   state.sort = DEFAULTS.sort;
   state.search = DEFAULTS.search;
@@ -1825,8 +2421,12 @@ function toggleFavoriteItemById(id) {
       previewKey: it.previewKey,
       mediaUrl: it.mediaUrl,
       transcodeUrl: it.transcodeUrl,
+      transcodeFileUrl: it.transcodeFileUrl,
       directPlayPreferred: it.directPlayPreferred,
       downloadUrl: it.downloadUrl,
+      previewUrl: it.previewUrl,
+      sourceArchiveId: it.sourceArchiveId,
+      archiveEntryPath: it.archiveEntryPath,
     });
   }
   saveFavorites();
@@ -1884,13 +2484,14 @@ function renderFavorites() {
     top.className = 'favorite-card-top';
     let hasTop = false;
 
-    if (node && state.showFolderThumbs && mediaPreviewTypeSet() && Number(node.counts?.video || 0) + Number(node.counts?.image || 0) > 0 && node.sampleMediaItemId) {
+    const previewId = node ? folderPreviewId(node) : null;
+    if (previewId) {
       const img = document.createElement('img');
       img.className = 'favorite-thumb';
       img.loading = 'lazy';
       img.decoding = 'async';
       img.alt = path;
-      img.src = purl(node.sampleMediaItemId);
+      img.src = purl(previewId);
       top.append(img);
       hasTop = true;
     }
@@ -1920,7 +2521,7 @@ function renderFavorites() {
 
     const top = document.createElement('div');
     top.className = 'favorite-card-top';
-    if (item.category === 'video' || item.category === 'image') {
+    if (hasImagePreview(item)) {
       const img = document.createElement('img');
       img.className = 'favorite-thumb';
       img.loading = 'lazy';
@@ -1953,22 +2554,32 @@ function renderFavorites() {
 }
 
 function clearPlayer() {
+  setOverlayMediaMode('');
   stopVideoFastForward();
   resetVideoRightKeyState();
   resetVideoPointerHoldState();
   resetVideoSpaceKeyState();
   resetVideoTapState();
   resetImagePointerState();
+  imageWheelNavDelta = 0;
+  imageWheelNavLockUntil = 0;
   clearVideoTouchHoldTimer();
+  clearVideoClickToggleTimer();
+  closeVideoMoreMenu();
+  videoSuppressClickUntil = 0;
   hideMediaActionIndicator(true);
   hideVideoLoadIndicator();
+  archivePreviewToken += 1;
+  archivePreviewItems = [];
   videoHasStartedPlaying = false;
   videoTouchHoldActive = false;
   E.video.pause();
   E.video.classList.add('hidden');
+  E.scrubWrap.classList.add('hidden');
   E.video.removeAttribute('src');
   E.video.removeAttribute('data-fallback-queue');
   E.video.removeAttribute('data-fallback-used');
+  E.video.removeAttribute('data-pending-seek');
   clearVideoFallbackTimer();
   clearVideoDecodeGuardTimer();
   E.video.playbackRate = 1;
@@ -1981,8 +2592,10 @@ function clearPlayer() {
   E.image.classList.remove('zoomable', 'zoomed');
   E.image.classList.add('hidden');
   E.image.removeAttribute('src');
-  E.scrubWrap.classList.add('hidden');
+  E.archive?.classList.add('hidden');
+  if (E.archive) E.archive.innerHTML = '';
   E.scrub.value = '0';
+  syncVideoControls();
 }
 
 function ovOpen() {
@@ -2027,7 +2640,7 @@ async function stripRender(items, activeId, imageMode) {
 
       const w = document.createElement('div');
       w.className = 'thumb-wrap';
-      if (it.category === 'video' || it.category === 'image') {
+      if (hasImagePreview(it)) {
         const img = document.createElement('img');
         img.alt = it.name;
         img.loading = 'lazy';
@@ -2061,6 +2674,7 @@ async function stripRender(items, activeId, imageMode) {
 function viewerItemsForCurrent(items, currentItem) {
   const list = Array.isArray(items) ? items : [];
   if (!currentItem) return list;
+  if (currentItem.sourceArchiveId || currentItem.archiveEntryPath) return list;
   if (currentItem.category !== 'image' && currentItem.category !== 'video') return list;
   const onlyMedia = list.filter((x) => x.category === 'image' || x.category === 'video');
   return onlyMedia.length ? onlyMedia : list;
@@ -2203,6 +2817,7 @@ async function openItem(id, opt = {}) {
   const sameImageSwitch = !E.overlay.classList.contains('hidden') && !E.image.classList.contains('hidden') && it.category === 'image';
   if (!sameImageSwitch) clearPlayer();
   ovOpen();
+  setOverlayMediaMode(it.category);
   E.download.href = it.downloadUrl;
   syncViewerTitle();
   syncCurrentFavoriteButton();
@@ -2210,7 +2825,11 @@ async function openItem(id, opt = {}) {
   if (it.category === 'video') {
     stopVideoFastForward();
     E.video.classList.remove('hidden');
+    E.scrubWrap.classList.remove('hidden');
+    E.video.controls = true;
     E.video.playbackRate = 1;
+    applyVideoFitMode();
+    syncVideoControls();
     playVideoWithFallback(it);
   } else if (it.category === 'audio') {
     E.audio.classList.remove('hidden');
@@ -2221,6 +2840,10 @@ async function openItem(id, opt = {}) {
     E.image.classList.add('zoomable');
     E.image.classList.remove('hidden');
     E.image.src = imageSrcForItem(it);
+  } else if (it.category === 'archive') {
+    resetImageZoom();
+    E.archive?.classList.remove('hidden');
+    loadArchivePreview(it);
   } else {
     resetImageZoom();
     E.image.classList.remove('zoomable', 'zoomed');
@@ -2228,8 +2851,13 @@ async function openItem(id, opt = {}) {
     E.image.src = purl(it);
   }
 
-  const navItems = Array.isArray(opt.navItems) && opt.navItems.length ? opt.navItems : await resolveViewerNav(it);
-  if (!(Array.isArray(opt.navItems) && opt.navItems.length)) setViewerNav(currentFolder, navItems);
+  const navItems =
+    Array.isArray(opt.navItems) && opt.navItems.length
+      ? opt.navItems
+      : it.sourceArchiveId && archivePreviewItems.length
+        ? archivePreviewItems
+        : await resolveViewerNav(it);
+  setViewerNav(currentFolder, navItems);
   await stripRender(navItems, it.id, it.category === 'image' || it.category === 'video');
   navSet(navItems);
   if (it.category === 'image') warmupNextImages(navItems, it.id);
@@ -2243,6 +2871,17 @@ async function openAdj(off) {
   const n = i + off;
   if (i < 0 || n < 0 || n >= ids.length) return;
   await openItem(ids[n], { navItems: arr });
+}
+
+async function openNextVideo() {
+  const current = itemStore.get(currentId);
+  const arr = await resolveViewerNav(current);
+  const startIndex = arr.findIndex((x) => x.id === currentId);
+  if (startIndex < 0) return false;
+  const next = arr.slice(startIndex + 1).find((x) => x.category === 'video');
+  if (!next) return false;
+  await openItem(next.id, { navItems: arr });
+  return true;
 }
 
 async function onMenu(action) {
@@ -2333,6 +2972,7 @@ E.menu.addEventListener('click', (e) => {
 
 document.addEventListener('click', (e) => {
   if (!E.menu.classList.contains('hidden') && !e.target.closest('#folder-menu')) closeMenu();
+  if (!E.videoMoreMenu?.classList.contains('hidden') && !e.target.closest('.video-settings')) closeVideoMoreMenu();
 });
 
 E.tree.addEventListener('click', (e) => {
@@ -2416,6 +3056,19 @@ E.strip.addEventListener('click', (e) => {
   if (b) openItem(b.dataset.itemId).catch(() => {});
 });
 
+E.archive?.addEventListener('click', (e) => {
+  const openBtn = e.target.closest('[data-action="open"][data-id]');
+  if (openBtn) {
+    openItem(openBtn.dataset.id, { navItems: archivePreviewItems }).catch(() => {});
+    return;
+  }
+
+  const favBtn = e.target.closest('[data-action="toggle-fav-item"][data-id]');
+  if (favBtn) {
+    toggleFavoriteItemById(favBtn.dataset.id || '');
+  }
+});
+
 E.image.addEventListener(
   'pointerdown',
   (e) => {
@@ -2468,10 +3121,16 @@ E.image.addEventListener(
 
 E.image.addEventListener('pointercancel', resetImagePointerState, { passive: true });
 E.image.addEventListener('dragstart', (e) => e.preventDefault());
+E.mediaWrap.addEventListener('click', handleVideoSurfaceClick);
+E.mediaWrap.addEventListener('wheel', handleImageWheelNavigate, { passive: false });
 
 window.addEventListener('keydown', (e) => {
   if (E.overlay.classList.contains('hidden')) return;
   if (e.key === 'Escape') {
+    if (!E.videoMoreMenu?.classList.contains('hidden')) {
+      closeVideoMoreMenu();
+      return;
+    }
     ovClose();
     return;
   }
@@ -2479,6 +3138,7 @@ window.addEventListener('keydown', (e) => {
   if (handleOverlayPageNavKey(e)) return;
   if (handleVideoSpaceKeyDown(e)) return;
   if (handleVideoArrowKeyDown(e)) return;
+  if (handleVideoShortcutKeyDown(e)) return;
 
   const current = currentId ? itemStore.get(currentId) : null;
   if (!current) return;
@@ -2501,7 +3161,8 @@ document.addEventListener(
   (e) => {
     if (handleOverlayPageNavKey(e)) return;
     if (handleVideoSpaceKeyDown(e)) return;
-    handleVideoArrowKeyDown(e);
+    if (handleVideoArrowKeyDown(e)) return;
+    handleVideoShortcutKeyDown(e);
   },
   { capture: true }
 );
@@ -2519,13 +3180,22 @@ document.addEventListener(
 E.video.addEventListener('loadedmetadata', () => {
   const d = Number(E.video.duration || 0);
   E.scrub.max = String(d || 0);
-  E.scrub.value = '0';
+  let nextTime = 0;
+  const pendingSeek = Number(E.video.dataset.pendingSeek || 0);
+  if (Number.isFinite(d) && d > 0 && Number.isFinite(pendingSeek) && pendingSeek > 0) {
+    nextTime = Math.max(0, Math.min(d, pendingSeek));
+  }
+  E.video.removeAttribute('data-pending-seek');
+  E.video.currentTime = nextTime;
+  E.scrub.value = String(nextTime);
   clearVideoFallbackTimer();
   updateVideoLoadIndicator();
+  syncVideoControls();
 });
 
 E.video.addEventListener('timeupdate', () => {
-  if (!E.scrub.matches(':active')) E.scrub.value = String(Number(E.video.currentTime || 0));
+  if (!videoScrubActive && !E.scrub.matches(':active')) E.scrub.value = String(Number(E.video.currentTime || 0));
+  syncVideoScrub();
   if (!videoHasStartedPlaying) updateVideoLoadIndicator();
 });
 
@@ -2534,10 +3204,12 @@ E.video.addEventListener('loadstart', () => {
   videoHasStartedPlaying = false;
   clearVideoDecodeGuardTimer();
   setVideoLoadIndicator('正在載入...');
+  syncVideoControls();
 });
 
 E.video.addEventListener('progress', () => {
   updateVideoLoadIndicator();
+  syncVideoScrub();
 });
 
 E.video.addEventListener('waiting', () => {
@@ -2545,6 +3217,7 @@ E.video.addEventListener('waiting', () => {
   setVideoLoadIndicator('緩衝中...');
   updateVideoLoadIndicator();
   armVideoDecodeGuard();
+  syncVideoControls();
 });
 
 E.video.addEventListener('stalled', () => {
@@ -2557,6 +3230,7 @@ E.video.addEventListener('canplay', () => {
   clearVideoFallbackTimer();
   if (!videoHasStartedPlaying) updateVideoLoadIndicator();
   armVideoDecodeGuard();
+  syncVideoControls();
 });
 
 E.video.addEventListener('playing', () => {
@@ -2564,19 +3238,67 @@ E.video.addEventListener('playing', () => {
   videoHasStartedPlaying = true;
   hideVideoLoadIndicator();
   armVideoDecodeGuard();
+  syncVideoControls();
 });
+
+E.video.addEventListener('pause', syncVideoControls);
+E.video.addEventListener('ended', handleVideoEnded);
+E.video.addEventListener('durationchange', syncVideoControls);
+E.video.addEventListener('volumechange', syncVideoControls);
+E.video.addEventListener('ratechange', syncVideoControls);
 
 E.video.addEventListener('error', () => {
   if (E.video.classList.contains('hidden')) return;
   setVideoLoadIndicator('切換串流路徑中...');
   clearVideoDecodeGuardTimer();
-  tryNextVideoFallback();
+  if (!tryNextVideoFallback()) setVideoLoadIndicator('影片無法播放');
+  syncVideoControls();
 });
 
 E.scrub.addEventListener('input', () => {
   const t = Number(E.scrub.value || 0);
   E.video.currentTime = t;
+  syncVideoScrub();
 });
+
+E.scrub.addEventListener('pointerdown', () => {
+  videoScrubActive = true;
+});
+
+E.scrub.addEventListener('pointerup', () => {
+  videoScrubActive = false;
+  E.video.currentTime = Number(E.scrub.value || 0);
+  syncVideoControls();
+});
+
+E.scrub.addEventListener('change', () => {
+  videoScrubActive = false;
+  E.video.currentTime = Number(E.scrub.value || 0);
+  syncVideoControls();
+});
+
+E.videoPlay?.addEventListener('click', toggleVideoPlayback);
+E.videoSkipBack?.addEventListener('click', () => seekVideoRelative(-viewerOptions.videoSeekSeconds));
+E.videoSkipForward?.addEventListener('click', () => seekVideoRelative(viewerOptions.videoSeekSeconds));
+E.videoMute?.addEventListener('click', toggleVideoMute);
+E.videoVolume?.addEventListener('input', () => setVideoVolume(E.videoVolume.value));
+E.videoSpeed?.addEventListener('change', () => setVideoRate(E.videoSpeed.value));
+E.videoMoreToggle?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleVideoMoreMenu();
+});
+E.videoMoreMenu?.addEventListener('click', (e) => {
+  const button = e.target.closest('[data-video-end-action]');
+  if (!button) return;
+  setVideoEndAction(button.dataset.videoEndAction);
+  closeVideoMoreMenu();
+});
+E.videoFit?.addEventListener('click', toggleVideoFitMode);
+E.videoPip?.addEventListener('click', () => toggleVideoPictureInPicture());
+E.videoFullscreen?.addEventListener('click', () => toggleVideoFullscreen());
+document.addEventListener('fullscreenchange', syncVideoControls);
+E.video.addEventListener('enterpictureinpicture', syncVideoControls);
+E.video.addEventListener('leavepictureinpicture', syncVideoControls);
 
 E.refresh.addEventListener('click', () => requestRescan().catch((e) => alert(e.message)));
 
@@ -2596,6 +3318,14 @@ E.detailToggle.addEventListener('click', () => {
   syncUI();
   schedule({ preserveScroll: true, resetAll: true });
 });
+
+if (E.playableFoldersToggle) {
+  E.playableFoldersToggle.addEventListener('click', () => {
+    state.hideUnplayableFolders = !state.hideUnplayableFolders;
+    syncUI();
+    schedule({ preserveScroll: true, resetAll: true });
+  });
+}
 
 E.viewerNameToggle.addEventListener('click', () => {
   state.showViewerTitle = !state.showViewerTitle;
